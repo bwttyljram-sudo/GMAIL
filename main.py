@@ -15,6 +15,23 @@ bot = telebot.TeleBot(BOT_TOKEN)
 CHANNEL_USERNAME = "@ZenoX_Tools"
 ADMIN_ID = 6043858925
 
+# ================= أزرار ملونة (ميزة Bot API 9.4) =================
+# style: "success" (أخضر) / "danger" (أحمر) / "primary" (أزرق) / None (افتراضي بدون لون)
+# محمية بـ try/except: لو نسخة المكتبة على الاستضافة أقدم ولا تدعم "style" بعد،
+# يتم إنشاء الزر بدون لون تلقائيًا بدل ما يتعطل البوت بالكامل.
+def colored_button(text, callback_data=None, url=None, style=None):
+    kwargs = {}
+    if callback_data is not None:
+        kwargs["callback_data"] = callback_data
+    if url is not None:
+        kwargs["url"] = url
+    if style:
+        try:
+            return InlineKeyboardButton(text, style=style, **kwargs)
+        except TypeError:
+            print("[colored_button] مكتبة pyTelegramBotAPI الحالية لا تدعم 'style' بعد، تم إنشاء الزر بدون لون.")
+    return InlineKeyboardButton(text, **kwargs)
+
 # ================= قاعدة بيانات المستخدمين والإحصائيات =================
 import sqlite3
 from datetime import datetime, timedelta
@@ -351,8 +368,8 @@ def send_welcome(message):
     # فحص الاشتراك
     if not check_subscription(user_id):
         markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("📢 انضم إلى قناة البوت", url=f"https://t.me/{CHANNEL_USERNAME[1:]}"))
-        markup.add(InlineKeyboardButton("✅ زر التحقق", callback_data="check_sub"))
+        markup.add(colored_button("📢 انضم إلى قناة البوت", url=f"https://t.me/{CHANNEL_USERNAME[1:]}", style="primary"))
+        markup.add(colored_button("✅ زر التحقق", callback_data="check_sub", style="success"))
         first_name = message.from_user.first_name or "صديقي"
         sub_text = (
             f"مرحبًا بك يا {first_name} في بوت GMAIL الذكي 👋\n\n"
@@ -365,8 +382,8 @@ def send_welcome(message):
         return
 
     markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("📨 إنشاء بريد عشوائي", callback_data="generate_email"))
-    markup.add(InlineKeyboardButton("👨‍💻 المطور", url="tg://user?id=6043858925"))
+    markup.add(colored_button("📨 إنشاء بريد عشوائي", callback_data="generate_email", style="success"))
+    markup.add(colored_button("👨‍💻 المطور", url="tg://user?id=6043858925", style="primary"))
     
     welcome_text = (
         "👋 **أهلًا بك في بوت GMAIL**\n\n"
@@ -415,8 +432,8 @@ def callback_query(call):
         email = mailbox["address"]
 
         markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🔄 فحص صندوق الوارد", callback_data="check_inbox"))
-        markup.add(InlineKeyboardButton("🗑️ تغيير البريد", callback_data="generate_email"))
+        markup.add(colored_button("🔄 فحص صندوق الوارد", callback_data="check_inbox", style="success"))
+        markup.add(colored_button("🗑️ تغيير البريد", callback_data="generate_email", style="danger"))
 
         text = (
             "✅ **تم إنشاء بريدك بنجاح**\n"
@@ -569,7 +586,7 @@ def format_stats_message():
 
 def stats_keyboard():
     markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("🔄 تحديث الإحصائيات", callback_data="refresh_stats"))
+    markup.add(colored_button("🔄 تحديث الإحصائيات", callback_data="refresh_stats", style="primary"))
     return markup
 
 
@@ -643,10 +660,26 @@ def general_text_handler(message):
 if __name__ == "__main__":
     # استدعاء السيرفر الوهمي لاستقبال النقرات
     keep_alive()
-    
+
     print("Bot is running...")
-    # تشغيل البوت
-    bot.infinity_polling(timeout=10, long_polling_timeout=5)
+
+    # ملاحظة مهمة بخصوص "حفظ طلبات المستخدمين وقت التعطل":
+    # تيليجرام نفسه يحتفظ بأي رسالة يرسلها المستخدم في طابور انتظار (حتى 24 ساعة تقريبًا)
+    # طالما ما فيه Webhook مفعّل، وطالما البوت ما يطلب تخطي الرسائل القديمة (skip_pending).
+    # بمجرد ما يرجع البوت يتصل بالسيرفر بعد أي انقطاع (صيانة/سقوط الاستضافة)، يستقبل
+    # كل الرسائل المتراكمة تلقائيًا ويرد عليها بالترتيب - بدون أي كود إضافي مطلوب لهذا الجزء.
+    #
+    # الإضافة هنا: حلقة إعادة تشغيل تلقائية، بحيث لو صار خطأ غير متوقع أوقف الاتصال بتيليجرام
+    # (مشكلة شبكة مؤقتة، إلخ)، البوت يعيد المحاولة من تلقاء نفسه بدل ما يتوقف نهائيًا.
+    while True:
+        try:
+            bot.infinity_polling(timeout=10, long_polling_timeout=5, skip_pending=False)
+        except Exception as e:
+            print(f"[main] توقف البوت بشكل غير متوقع، إعادة المحاولة خلال 5 ثوانٍ: {e}")
+            time.sleep(5)
+
+
+
 
 
 
