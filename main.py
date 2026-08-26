@@ -339,13 +339,18 @@ def check_subscription(user_id):
     if user_id == ADMIN_ID: # تجاوز الأدمن من الفحص
         return True
     try:
-        status = bot.get_chat_member(CHANNEL_USERNAME, user_id).status
+        member = bot.get_chat_member(CHANNEL_USERNAME, user_id)
+        status = member.status
         if status in ['member', 'administrator', 'creator']:
             return True
+        print(f"[check_subscription] المستخدم {user_id} حالته '{status}' (غير مشترك)")
         return False
-    except:
-        # في حال لم يكن البوت مشرفاً في القناة
-        return False
+    except Exception as e:
+        # نطبع الخطأ الحقيقي في اللوجز بدل إخفائه بصمت (كان السبب الرئيسي لصعوبة تشخيص المشكلة)
+        print(f"[check_subscription] فشل التحقق للمستخدم {user_id}: {type(e).__name__}: {e}")
+        # في حال فشل الفحص لسبب تقني (وليس لأن المستخدم فعلاً غير مشترك)،
+        # نسمح له مؤقتًا بالدخول بدل حجبه بالخطأ - أفضل من تعطيل البوت بالكامل لكل المستخدمين
+        return True
 
 # 2. نظام الحد من الطلبات (Rate Limit)
 def is_rate_limited(user_id):
@@ -613,6 +618,48 @@ def run_broadcast(from_chat_id, from_message_id):
         pass
 
 
+@bot.message_handler(commands=['checksub'])
+def checksub_command(message):
+    """أمر تشخيص فوري للأدمن: يفحص اشتراك مستخدم معيّن ويعرض السبب الحقيقي لأي فشل مباشرة في تيليجرام."""
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    parts = message.text.strip().split()
+    target_id = parts[1] if len(parts) > 1 else str(message.from_user.id)
+
+    report = [f"🔍 **تشخيص الاشتراك**\n\nالقناة المستخدمة: `{CHANNEL_USERNAME}`\nمعرف المستخدم المفحوص: `{target_id}`\n"]
+
+    # 1) فحص هوية البوت نفسه ودوره
+    try:
+        bot_info = bot.get_me()
+        report.append(f"🤖 البوت: @{bot_info.username} (ID: {bot_info.id})")
+    except Exception as e:
+        report.append(f"❌ فشل جلب معلومات البوت نفسه: {type(e).__name__}: {e}")
+
+    # 2) فحص هل البوت فعلاً مشرف في القناة (وين المشكلة الحقيقية غالبًا)
+    try:
+        bot_member = bot.get_chat_member(CHANNEL_USERNAME, bot.get_me().id)
+        report.append(f"👮 حالة البوت في القناة: `{bot_member.status}`")
+        if bot_member.status not in ["administrator", "creator"]:
+            report.append("⚠️ **هذا هو السبب على الأغلب:** البوت ليس مشرفًا فعليًا من منظور تيليجرام (تأكد إنه مضاف من قسم Administrators في إعدادات القناة، مو بس عضو عادي).")
+    except Exception as e:
+        report.append(f"❌ فشل فحص عضوية البوت بالقناة: {type(e).__name__}: {e}")
+        report.append("⚠️ هذا الفشل بالذات يعني البوت غالبًا غير مضاف كمشرف على الإطلاق، أو اسم القناة خاطئ.")
+
+    # 3) فحص المستخدم المطلوب تحديدًا
+    try:
+        member = bot.get_chat_member(CHANNEL_USERNAME, int(target_id))
+        report.append(f"\n👤 حالة المستخدم `{target_id}`: `{member.status}`")
+        if member.status in ['member', 'administrator', 'creator']:
+            report.append("✅ هذا المستخدم مشترك فعليًا - يفترض يدخل البوت بدون مشاكل.")
+        else:
+            report.append(f"❌ هذا المستخدم فعليًا حالته '{member.status}' في القناة (غير مشترك أو غادر).")
+    except Exception as e:
+        report.append(f"\n❌ فشل فحص المستخدم `{target_id}`: {type(e).__name__}: {e}")
+
+    bot.reply_to(message, "\n".join(report), parse_mode="Markdown")
+
+
 @bot.message_handler(commands=['broadcast', 'اذاعة'])
 def broadcast_command(message):
     if message.from_user.id != ADMIN_ID:
@@ -677,6 +724,12 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"[main] توقف البوت بشكل غير متوقع، إعادة المحاولة خلال 5 ثوانٍ: {e}")
             time.sleep(5)
+
+
+
+
+
+
 
 
 
