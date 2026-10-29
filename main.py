@@ -26,7 +26,19 @@ keep_alive()
 import libsql_client
 from datetime import datetime, timedelta
 
-TURSO_DATABASE_URL = os.getenv("TURSO_DATABASE_URL")
+def _normalize_turso_url(url):
+    """
+    يحول رابط libsql:// إلى https:// عشان الاتصال يصير عبر HTTP عادي
+    بدل WebSocket. مكتبة libsql_client (archived/متوقفة عن التطوير) فيها
+    مشاكل توافق معروفة بالـ WebSocket Handshake مع بايثون الحديثة —
+    اتصال HTTP أكثر استقرارًا ومضمون الدعم.
+    """
+    if url and url.startswith("libsql://"):
+        return "https://" + url[len("libsql://"):]
+    return url
+
+
+TURSO_DATABASE_URL = _normalize_turso_url(os.getenv("TURSO_DATABASE_URL"))
 TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
 
 db_client = libsql_client.create_client_sync(
@@ -64,25 +76,32 @@ def init_db():
 
 
 def track_user(user_id, username=None):
-    """يسجل المستخدم إذا كان جديدًا، ويحدّث آخر نشاط له."""
-    now = datetime.utcnow().isoformat()
-    exists = db_execute("SELECT user_id FROM users WHERE user_id = ?", [user_id])
-    if exists.rows:
-        db_execute("UPDATE users SET last_active = ?, username = ? WHERE user_id = ?", [now, username, user_id])
-    else:
-        db_execute(
-            "INSERT INTO users (user_id, username, first_seen, last_active) VALUES (?, ?, ?, ?)",
-            [user_id, username, now, now],
-        )
+    """يسجل المستخدم إذا كان جديدًا، ويحدّث آخر نشاط له.
+    ملاحظة: محاط بـ try/except عمدًا — أي تعطل بقاعدة البيانات لا يجوز أن يمنع البوت من الرد على المستخدم."""
+    try:
+        now = datetime.utcnow().isoformat()
+        exists = db_execute("SELECT user_id FROM users WHERE user_id = ?", [user_id])
+        if exists.rows:
+            db_execute("UPDATE users SET last_active = ?, username = ? WHERE user_id = ?", [now, username, user_id])
+        else:
+            db_execute(
+                "INSERT INTO users (user_id, username, first_seen, last_active) VALUES (?, ?, ?, ?)",
+                [user_id, username, now, now],
+            )
+    except Exception as e:
+        print(f"[track_user] تعذر الكتابة بقاعدة البيانات: {e}")
 
 
 def log_request(user_id, action):
-    """يسجل حدث/طلب معين لأغراض الإحصائيات."""
-    now = datetime.utcnow().isoformat()
-    db_execute(
-        "INSERT INTO requests_log (user_id, action, created_at) VALUES (?, ?, ?)",
-        [user_id, action, now],
-    )
+    """يسجل حدث/طلب معين لأغراض الإحصائيات (نفس ملاحظة track_user أعلاه)."""
+    try:
+        now = datetime.utcnow().isoformat()
+        db_execute(
+            "INSERT INTO requests_log (user_id, action, created_at) VALUES (?, ?, ?)",
+            [user_id, action, now],
+        )
+    except Exception as e:
+        print(f"[log_request] تعذر الكتابة بقاعدة البيانات: {e}")
 
 
 def get_stats():
@@ -594,7 +613,10 @@ def stats_command(message):
     track_user(user_id, message.from_user.username)
     if user_id != ADMIN_ID:
         return  # يتجاهل الطلب تمامًا لغير الأدمن دون أي رد
-    bot.reply_to(message, format_stats_message(), reply_markup=stats_keyboard(), parse_mode="Markdown")
+    try:
+        bot.reply_to(message, format_stats_message(), reply_markup=stats_keyboard(), parse_mode="Markdown")
+    except Exception as e:
+        bot.reply_to(message, f"⚠️ تعذر جلب الإحصائيات حاليًا (مشكلة اتصال بقاعدة البيانات).\n`{e}`", parse_mode="Markdown")
 
 
 @bot.message_handler(commands=['broadcast', 'اذاعة'])
@@ -634,7 +656,10 @@ def general_text_handler(message):
     if message.content_type == "text" and message.text.strip() in ["احصائيات", "إحصائيات"]:
         if user_id != ADMIN_ID:
             return  # يتجاهل الطلب تمامًا لغير الأدمن دون أي رد
-        bot.reply_to(message, format_stats_message(), reply_markup=stats_keyboard(), parse_mode="Markdown")
+        try:
+            bot.reply_to(message, format_stats_message(), reply_markup=stats_keyboard(), parse_mode="Markdown")
+        except Exception as e:
+            bot.reply_to(message, f"⚠️ تعذر جلب الإحصائيات حاليًا (مشكلة اتصال بقاعدة البيانات).\n`{e}`", parse_mode="Markdown")
         return
 
     # أي رسالة نصية أخرى من مستخدم عادي: لا شيء (تفادي إزعاج المستخدم بردود غير ضرورية)
