@@ -1,5 +1,5 @@
 import telebot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, BotCommand, BotCommandScopeChat
 import requests
 import time
 import os
@@ -15,38 +15,32 @@ bot = telebot.TeleBot(BOT_TOKEN)
 CHANNEL_USERNAME = "@ZenoX_Tools"
 ADMIN_ID = 6043858925
 
-# ================= أزرار ملونة (ميزة Bot API 9.4) =================
-# style: "success" (أخضر) / "danger" (أحمر) / "primary" (أزرق) / None (افتراضي بدون لون)
-# محمية بـ try/except: لو نسخة المكتبة على الاستضافة أقدم ولا تدعم "style" بعد،
-# يتم إنشاء الزر بدون لون تلقائيًا بدل ما يتعطل البوت بالكامل.
-def colored_button(text, callback_data=None, url=None, style=None):
-    kwargs = {}
-    if callback_data is not None:
-        kwargs["callback_data"] = callback_data
-    if url is not None:
-        kwargs["url"] = url
-    if style:
-        try:
-            return InlineKeyboardButton(text, style=style, **kwargs)
-        except TypeError:
-            print("[colored_button] مكتبة pyTelegramBotAPI الحالية لا تدعم 'style' بعد، تم إنشاء الزر بدون لون.")
-    return InlineKeyboardButton(text, **kwargs)
-
-# ================= قاعدة بيانات المستخدمين والإحصائيات =================
-import sqlite3
+# ================= قاعدة بيانات المستخدمين والإحصائيات (Turso / libSQL) =================
+# بدل SQLite المحلية (كانت تنمسح كل مرة يعيد ريندر تشغيل الخدمة على الخطة المجانية)،
+# نحفظ كل شيء على قاعدة بيانات Turso السحابية الدائمة.
+import libsql_client
 from datetime import datetime, timedelta
 
-DB_PATH = "bot_data.db"
+TURSO_DATABASE_URL = os.getenv("TURSO_DATABASE_URL")
+TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
+
+db_client = libsql_client.create_client_sync(
+    url=TURSO_DATABASE_URL,
+    auth_token=TURSO_AUTH_TOKEN,
+)
+# عميل libsql_client مبني داخليًا على asyncio، فنقفل الوصول له عشان يكون آمن
+# حتى لو استخدمته أكثر من Thread بنفس الوقت (زي Thread الإذاعة).
+db_lock = threading.Lock()
 
 
-def db_connect():
-    return sqlite3.connect(DB_PATH)
+def db_execute(sql, params=None):
+    """تنفيذ استعلام واحد على Turso بأمان من عدة Threads."""
+    with db_lock:
+        return db_client.execute(sql, params or [])
 
 
 def init_db():
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("""
+    db_execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             username TEXT,
@@ -54,7 +48,7 @@ def init_db():
             last_active TEXT
         )
     """)
-    cur.execute("""
+    db_execute("""
         CREATE TABLE IF NOT EXISTS requests_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
@@ -62,39 +56,28 @@ def init_db():
             created_at TEXT
         )
     """)
-    conn.commit()
-    conn.close()
 
 
 def track_user(user_id, username=None):
     """يسجل المستخدم إذا كان جديدًا، ويحدّث آخر نشاط له."""
     now = datetime.utcnow().isoformat()
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
-    exists = cur.fetchone()
-    if exists:
-        cur.execute("UPDATE users SET last_active = ?, username = ? WHERE user_id = ?", (now, username, user_id))
+    exists = db_execute("SELECT user_id FROM users WHERE user_id = ?", [user_id])
+    if exists.rows:
+        db_execute("UPDATE users SET last_active = ?, username = ? WHERE user_id = ?", [now, username, user_id])
     else:
-        cur.execute(
+        db_execute(
             "INSERT INTO users (user_id, username, first_seen, last_active) VALUES (?, ?, ?, ?)",
-            (user_id, username, now, now),
+            [user_id, username, now, now],
         )
-    conn.commit()
-    conn.close()
 
 
 def log_request(user_id, action):
     """يسجل حدث/طلب معين لأغراض الإحصائيات."""
     now = datetime.utcnow().isoformat()
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute(
+    db_execute(
         "INSERT INTO requests_log (user_id, action, created_at) VALUES (?, ?, ?)",
-        (user_id, action, now),
+        [user_id, action, now],
     )
-    conn.commit()
-    conn.close()
 
 
 def get_stats():
@@ -105,41 +88,23 @@ def get_stats():
     d7 = (now - timedelta(days=7)).isoformat()
     d30 = (now - timedelta(days=30)).isoformat()
 
-    conn = db_connect()
-    cur = conn.cursor()
+    total_users = db_execute("SELECT COUNT(*) FROM users").rows[0][0]
+    active_now = db_execute("SELECT COUNT(*) FROM users WHERE last_active >= ?", [d5min]).rows[0][0]
+    active_today = db_execute("SELECT COUNT(*) FROM users WHERE last_active LIKE ?", [f"{today_start}%"]).rows[0][0]
+    active_7d = db_execute("SELECT COUNT(*) FROM users WHERE last_active >= ?", [d7]).rows[0][0]
+    active_30d = db_execute("SELECT COUNT(*) FROM users WHERE last_active >= ?", [d30]).rows[0][0]
 
-    cur.execute("SELECT COUNT(*) FROM users")
-    total_users = cur.fetchone()[0]
+    requests_today = db_execute("SELECT COUNT(*) FROM requests_log WHERE created_at LIKE ?", [f"{today_start}%"]).rows[0][0]
+    requests_7d = db_execute("SELECT COUNT(*) FROM requests_log WHERE created_at >= ?", [d7]).rows[0][0]
+    requests_30d = db_execute("SELECT COUNT(*) FROM requests_log WHERE created_at >= ?", [d30]).rows[0][0]
 
-    cur.execute("SELECT COUNT(*) FROM users WHERE last_active >= ?", (d5min,))
-    active_now = cur.fetchone()[0]
-
-    cur.execute("SELECT COUNT(*) FROM users WHERE last_active LIKE ?", (f"{today_start}%",))
-    active_today = cur.fetchone()[0]
-
-    cur.execute("SELECT COUNT(*) FROM users WHERE last_active >= ?", (d7,))
-    active_7d = cur.fetchone()[0]
-
-    cur.execute("SELECT COUNT(*) FROM users WHERE last_active >= ?", (d30,))
-    active_30d = cur.fetchone()[0]
-
-    cur.execute("SELECT COUNT(*) FROM requests_log WHERE created_at LIKE ?", (f"{today_start}%",))
-    requests_today = cur.fetchone()[0]
-
-    cur.execute("SELECT COUNT(*) FROM requests_log WHERE created_at >= ?", (d7,))
-    requests_7d = cur.fetchone()[0]
-
-    cur.execute("SELECT COUNT(*) FROM requests_log WHERE created_at >= ?", (d30,))
-    requests_30d = cur.fetchone()[0]
-
-    cur.execute("""
+    breakdown_rows = db_execute("""
         SELECT action, COUNT(*) FROM requests_log
         WHERE created_at LIKE ?
         GROUP BY action ORDER BY COUNT(*) DESC
-    """, (f"{today_start}%",))
-    breakdown_today = cur.fetchall()
+    """, [f"{today_start}%"]).rows
+    breakdown_today = [(row[0], row[1]) for row in breakdown_rows]
 
-    conn.close()
     return {
         "total_users": total_users,
         "active_now": active_now,
@@ -154,12 +119,8 @@ def get_stats():
 
 
 def get_all_user_ids():
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("SELECT user_id FROM users")
-    ids = [row[0] for row in cur.fetchall()]
-    conn.close()
-    return ids
+    rows = db_execute("SELECT user_id FROM users").rows
+    return [row[0] for row in rows]
 
 
 init_db()
@@ -339,18 +300,13 @@ def check_subscription(user_id):
     if user_id == ADMIN_ID: # تجاوز الأدمن من الفحص
         return True
     try:
-        member = bot.get_chat_member(CHANNEL_USERNAME, user_id)
-        status = member.status
+        status = bot.get_chat_member(CHANNEL_USERNAME, user_id).status
         if status in ['member', 'administrator', 'creator']:
             return True
-        print(f"[check_subscription] المستخدم {user_id} حالته '{status}' (غير مشترك)")
         return False
-    except Exception as e:
-        # نطبع الخطأ الحقيقي في اللوجز بدل إخفائه بصمت (كان السبب الرئيسي لصعوبة تشخيص المشكلة)
-        print(f"[check_subscription] فشل التحقق للمستخدم {user_id}: {type(e).__name__}: {e}")
-        # في حال فشل الفحص لسبب تقني (وليس لأن المستخدم فعلاً غير مشترك)،
-        # نسمح له مؤقتًا بالدخول بدل حجبه بالخطأ - أفضل من تعطيل البوت بالكامل لكل المستخدمين
-        return True
+    except:
+        # في حال لم يكن البوت مشرفاً في القناة
+        return False
 
 # 2. نظام الحد من الطلبات (Rate Limit)
 def is_rate_limited(user_id):
@@ -373,8 +329,8 @@ def send_welcome(message):
     # فحص الاشتراك
     if not check_subscription(user_id):
         markup = InlineKeyboardMarkup()
-        markup.add(colored_button("📢 انضم إلى قناة البوت", url=f"https://t.me/{CHANNEL_USERNAME[1:]}", style="primary"))
-        markup.add(colored_button("✅ زر التحقق", callback_data="check_sub", style="success"))
+        markup.add(InlineKeyboardButton("📢 انضم إلى قناة البوت", url=f"https://t.me/{CHANNEL_USERNAME[1:]}"))
+        markup.add(InlineKeyboardButton("✅ زر التحقق", callback_data="check_sub"))
         first_name = message.from_user.first_name or "صديقي"
         sub_text = (
             f"مرحبًا بك يا {first_name} في بوت GMAIL الذكي 👋\n\n"
@@ -387,8 +343,8 @@ def send_welcome(message):
         return
 
     markup = InlineKeyboardMarkup()
-    markup.add(colored_button("📨 إنشاء بريد عشوائي", callback_data="generate_email", style="success"))
-    markup.add(colored_button("👨‍💻 المطور", url="tg://user?id=6043858925", style="primary"))
+    markup.add(InlineKeyboardButton("📨 إنشاء بريد عشوائي", callback_data="generate_email"))
+    markup.add(InlineKeyboardButton("👨‍💻 المطور", url="tg://user?id=6043858925"))
     
     welcome_text = (
         "👋 **أهلًا بك في بوت GMAIL**\n\n"
@@ -437,8 +393,8 @@ def callback_query(call):
         email = mailbox["address"]
 
         markup = InlineKeyboardMarkup()
-        markup.add(colored_button("🔄 فحص صندوق الوارد", callback_data="check_inbox", style="success"))
-        markup.add(colored_button("🗑️ تغيير البريد", callback_data="generate_email", style="danger"))
+        markup.add(InlineKeyboardButton("🔄 فحص صندوق الوارد", callback_data="check_inbox"))
+        markup.add(InlineKeyboardButton("🗑️ تغيير البريد", callback_data="generate_email"))
 
         text = (
             "✅ **تم إنشاء بريدك بنجاح**\n"
@@ -591,7 +547,7 @@ def format_stats_message():
 
 def stats_keyboard():
     markup = InlineKeyboardMarkup()
-    markup.add(colored_button("🔄 تحديث الإحصائيات", callback_data="refresh_stats", style="primary"))
+    markup.add(InlineKeyboardButton("🔄 تحديث الإحصائيات", callback_data="refresh_stats"))
     return markup
 
 
@@ -618,46 +574,14 @@ def run_broadcast(from_chat_id, from_message_id):
         pass
 
 
-@bot.message_handler(commands=['checksub'])
-def checksub_command(message):
-    """أمر تشخيص فوري للأدمن: يفحص اشتراك مستخدم معيّن ويعرض السبب الحقيقي لأي فشل مباشرة في تيليجرام."""
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    parts = message.text.strip().split()
-    target_id = parts[1] if len(parts) > 1 else str(message.from_user.id)
-
-    report = [f"🔍 **تشخيص الاشتراك**\n\nالقناة المستخدمة: `{CHANNEL_USERNAME}`\nمعرف المستخدم المفحوص: `{target_id}`\n"]
-
-    # 1) فحص هوية البوت نفسه ودوره
-    try:
-        bot_info = bot.get_me()
-        report.append(f"🤖 البوت: @{bot_info.username} (ID: {bot_info.id})")
-    except Exception as e:
-        report.append(f"❌ فشل جلب معلومات البوت نفسه: {type(e).__name__}: {e}")
-
-    # 2) فحص هل البوت فعلاً مشرف في القناة (وين المشكلة الحقيقية غالبًا)
-    try:
-        bot_member = bot.get_chat_member(CHANNEL_USERNAME, bot.get_me().id)
-        report.append(f"👮 حالة البوت في القناة: `{bot_member.status}`")
-        if bot_member.status not in ["administrator", "creator"]:
-            report.append("⚠️ **هذا هو السبب على الأغلب:** البوت ليس مشرفًا فعليًا من منظور تيليجرام (تأكد إنه مضاف من قسم Administrators في إعدادات القناة، مو بس عضو عادي).")
-    except Exception as e:
-        report.append(f"❌ فشل فحص عضوية البوت بالقناة: {type(e).__name__}: {e}")
-        report.append("⚠️ هذا الفشل بالذات يعني البوت غالبًا غير مضاف كمشرف على الإطلاق، أو اسم القناة خاطئ.")
-
-    # 3) فحص المستخدم المطلوب تحديدًا
-    try:
-        member = bot.get_chat_member(CHANNEL_USERNAME, int(target_id))
-        report.append(f"\n👤 حالة المستخدم `{target_id}`: `{member.status}`")
-        if member.status in ['member', 'administrator', 'creator']:
-            report.append("✅ هذا المستخدم مشترك فعليًا - يفترض يدخل البوت بدون مشاكل.")
-        else:
-            report.append(f"❌ هذا المستخدم فعليًا حالته '{member.status}' في القناة (غير مشترك أو غادر).")
-    except Exception as e:
-        report.append(f"\n❌ فشل فحص المستخدم `{target_id}`: {type(e).__name__}: {e}")
-
-    bot.reply_to(message, "\n".join(report), parse_mode="Markdown")
+@bot.message_handler(commands=['stats'])
+def stats_command(message):
+    """أمر /stats بقائمة أوامر تيليجرام (للأدمن فقط)."""
+    user_id = message.from_user.id
+    track_user(user_id, message.from_user.username)
+    if user_id != ADMIN_ID:
+        return  # يتجاهل الطلب تمامًا لغير الأدمن دون أي رد
+    bot.reply_to(message, format_stats_message(), reply_markup=stats_keyboard(), parse_mode="Markdown")
 
 
 @bot.message_handler(commands=['broadcast', 'اذاعة'])
@@ -704,34 +628,31 @@ def general_text_handler(message):
 
 
 # ================= تشغيل البوت والخادم =================
+def setup_bot_commands():
+    """يسجل قائمة الأوامر التي تظهر لما يكتب المستخدم / بتيليجرام."""
+    public_commands = [
+        BotCommand("start", "🚀 بدء استخدام البوت"),
+    ]
+    admin_commands = public_commands + [
+        BotCommand("stats", "📊 إحصائيات البوت (أدمن)"),
+    ]
+    bot.set_my_commands(public_commands)  # القائمة الافتراضية لكل المستخدمين
+    try:
+        # قائمة أوسع (فيها /stats) تظهر فقط للأدمن، بدون ما تنكشف لبقية المستخدمين
+        bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(ADMIN_ID))
+    except Exception as e:
+        print(f"[setup_bot_commands] تعذر تخصيص قائمة أوامر الأدمن: {e}")
+
+
 if __name__ == "__main__":
     # استدعاء السيرفر الوهمي لاستقبال النقرات
     keep_alive()
 
+    setup_bot_commands()
+
     print("Bot is running...")
-
-    # ملاحظة مهمة بخصوص "حفظ طلبات المستخدمين وقت التعطل":
-    # تيليجرام نفسه يحتفظ بأي رسالة يرسلها المستخدم في طابور انتظار (حتى 24 ساعة تقريبًا)
-    # طالما ما فيه Webhook مفعّل، وطالما البوت ما يطلب تخطي الرسائل القديمة (skip_pending).
-    # بمجرد ما يرجع البوت يتصل بالسيرفر بعد أي انقطاع (صيانة/سقوط الاستضافة)، يستقبل
-    # كل الرسائل المتراكمة تلقائيًا ويرد عليها بالترتيب - بدون أي كود إضافي مطلوب لهذا الجزء.
-    #
-    # الإضافة هنا: حلقة إعادة تشغيل تلقائية، بحيث لو صار خطأ غير متوقع أوقف الاتصال بتيليجرام
-    # (مشكلة شبكة مؤقتة، إلخ)، البوت يعيد المحاولة من تلقاء نفسه بدل ما يتوقف نهائيًا.
-    while True:
-        try:
-            bot.infinity_polling(timeout=10, long_polling_timeout=5, skip_pending=False)
-        except Exception as e:
-            print(f"[main] توقف البوت بشكل غير متوقع، إعادة المحاولة خلال 5 ثوانٍ: {e}")
-            time.sleep(5)
-
-
-
-
-
-
-
-
+    # تشغيل البوت
+    bot.infinity_polling(timeout=10, long_polling_timeout=5)
 
 
 
