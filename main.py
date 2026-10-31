@@ -51,19 +51,9 @@ db_lock = threading.Lock()
 
 
 def db_execute(sql, params=None):
-    """
-    تنفيذ استعلام واحد على Turso بأمان من عدة Threads.
-    ننتظر القفل لمدة محدودة فقط (8 ثوانٍ) بدل الانتظار للأبد — لو تعلّق طلب واحد
-    (مثلاً بسبب بطء بالشبكة)، باقي أوامر البوت (زي /start) ما تتوقف وتسكت،
-    بل تفشل بسرعة وتدخل بمسار except الموجود أصلاً عند كل استدعاء.
-    """
-    acquired = db_lock.acquire(timeout=8)
-    if not acquired:
-        raise TimeoutError("تعذر الحصول على قفل قاعدة البيانات خلال 8 ثوانٍ (طلب آخر متعلّق)")
-    try:
+    """تنفيذ استعلام واحد على Turso بأمان من عدة Threads."""
+    with db_lock:
         return db_client.execute(sql, params or [])
-    finally:
-        db_lock.release()
 
 
 def init_db():
@@ -81,27 +71,6 @@ def init_db():
             user_id INTEGER,
             action TEXT,
             created_at TEXT
-        )
-    """)
-    # بريد المستخدم النشط، محفوظ بشكل دائم حتى يبقى شغالًا بعد إعادة تشغيل السيرفر
-    db_execute("""
-        CREATE TABLE IF NOT EXISTS active_mailboxes (
-            user_id INTEGER PRIMARY KEY,
-            provider TEXT,
-            address TEXT,
-            password TEXT,
-            token TEXT,
-            login TEXT,
-            domain TEXT,
-            created_at TEXT
-        )
-    """)
-    # الرسائل التي تم عرضها مسبقًا، محفوظة بشكل دائم لتفادي إعادة إرسالها بعد إعادة التشغيل
-    db_execute("""
-        CREATE TABLE IF NOT EXISTS seen_messages (
-            user_id INTEGER,
-            message_id TEXT,
-            PRIMARY KEY (user_id, message_id)
         )
     """)
 
@@ -178,107 +147,6 @@ def get_all_user_ids():
     return [row[0] for row in rows]
 
 
-# ================= تخزين دائم للبريد النشط + الرسائل المقروءة (Turso) =================
-
-def save_active_mailbox(user_id, mailbox):
-    """يحفظ بريد المستخدم النشط بشكل دائم حتى لو أعاد السيرفر التشغيل."""
-    try:
-        db_execute("DELETE FROM active_mailboxes WHERE user_id = ?", [user_id])
-        db_execute(
-            "INSERT INTO active_mailboxes (user_id, provider, address, password, token, login, domain, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            [
-                user_id,
-                mailbox.get("provider"),
-                mailbox.get("address"),
-                mailbox.get("password"),
-                mailbox.get("token"),
-                mailbox.get("login"),
-                mailbox.get("domain"),
-                datetime.utcnow().isoformat(),
-            ],
-        )
-    except Exception as e:
-        print(f"[save_active_mailbox] تعذر الحفظ: {e}")
-
-
-def load_active_mailbox(user_id):
-    """يحمّل بريد المستخدم النشط من Turso (يُستخدم بعد إعادة تشغيل السيرفر مثلًا)."""
-    try:
-        rows = db_execute(
-            "SELECT provider, address, password, token, login, domain FROM active_mailboxes WHERE user_id = ?",
-            [user_id],
-        ).rows
-        if not rows:
-            return None
-        r = rows[0]
-        return {"provider": r[0], "address": r[1], "password": r[2], "token": r[3], "login": r[4], "domain": r[5]}
-    except Exception as e:
-        print(f"[load_active_mailbox] تعذر التحميل: {e}")
-        return None
-
-
-def get_all_active_mailboxes():
-    """يرجع كل البريد النشط لكل المستخدمين، تُستخدم في مراقبة الوارد التلقائية بالخلفية."""
-    try:
-        rows = db_execute(
-            "SELECT user_id, provider, address, password, token, login, domain FROM active_mailboxes"
-        ).rows
-        return [
-            (r[0], {"provider": r[1], "address": r[2], "password": r[3], "token": r[4], "login": r[5], "domain": r[6]})
-            for r in rows
-        ]
-    except Exception as e:
-        print(f"[get_all_active_mailboxes] تعذر الجلب: {e}")
-        return []
-
-
-def get_mailbox(user_id):
-    """يرجع بريد المستخدم النشط من الذاكرة، أو يحمّله من Turso إذا لم يكن محمّلًا بعد."""
-    if user_id in user_emails:
-        return user_emails[user_id]
-    mailbox = load_active_mailbox(user_id)
-    if mailbox:
-        user_emails[user_id] = mailbox
-    return mailbox
-
-
-def get_seen_ids(user_id):
-    try:
-        rows = db_execute("SELECT message_id FROM seen_messages WHERE user_id = ?", [user_id]).rows
-        return set(row[0] for row in rows)
-    except Exception as e:
-        print(f"[get_seen_ids] تعذر الجلب: {e}")
-        return set()
-
-
-def get_seen_set(user_id):
-    """نسخة مخزّنة بالذاكرة من الرسائل المقروءة، تُحمّل من Turso أول مرة فقط."""
-    if user_id not in user_seen_messages:
-        user_seen_messages[user_id] = get_seen_ids(user_id)
-    return user_seen_messages[user_id]
-
-
-def mark_message_seen(user_id, message_id):
-    get_seen_set(user_id).add(message_id)
-    try:
-        db_execute(
-            "INSERT OR IGNORE INTO seen_messages (user_id, message_id) VALUES (?, ?)",
-            [user_id, str(message_id)],
-        )
-    except Exception as e:
-        print(f"[mark_message_seen] تعذر الحفظ: {e}")
-
-
-def clear_seen(user_id):
-    """يصفّر سجل الرسائل المقروءة عند إنشاء بريد جديد (البريد الجديد = صندوق فارغ)."""
-    user_seen_messages[user_id] = set()
-    try:
-        db_execute("DELETE FROM seen_messages WHERE user_id = ?", [user_id])
-    except Exception as e:
-        print(f"[clear_seen] تعذر الحذف: {e}")
-
-
 def get_user_personal_stats(user_id):
     """يجمع إحصائيات شخصية لمستخدم واحد: تاريخ انضمامه، عدد مرات إنشاء البريد، وعدد مرات فحص الوارد."""
     user_row = db_execute("SELECT first_seen FROM users WHERE user_id = ?", [user_id]).rows
@@ -327,21 +195,14 @@ threading.Thread(target=_init_db_safe, daemon=True).start()
 MAILTM_BASE = "https://api.mail.tm"
 
 
-def mailtm_list_domains():
-    """يرجع قائمة الدومينات المتاحة حاليًا على mail.tm (تُستخدم لميزة اختيار الدومين)."""
-    resp = requests.get(f"{MAILTM_BASE}/domains", timeout=10)
-    resp.raise_for_status()
-    domains = resp.json().get("hydra:member", [])
-    return [d["domain"] for d in domains]
-
-
-def _mailtm_create_account(domain=None):
-    """ينشئ حساب mail.tm جديد ويعيد (email, password, token). يقبل دومين محدد اختياريًا."""
-    if not domain:
-        domains = mailtm_list_domains()
-        if not domains:
-            raise RuntimeError("لا توجد دومينات متاحة على mail.tm حاليًا")
-        domain = domains[0]
+def _mailtm_create_account():
+    """ينشئ حساب mail.tm جديد ويعيد (email, password, token)."""
+    domains_resp = requests.get(f"{MAILTM_BASE}/domains", timeout=10)
+    domains_resp.raise_for_status()
+    domains = domains_resp.json().get("hydra:member", [])
+    if not domains:
+        raise RuntimeError("لا توجد دومينات متاحة على mail.tm حاليًا")
+    domain = domains[0]["domain"]
 
     login = generate_random_login()
     password = generate_random_login(14)
@@ -416,10 +277,10 @@ def _onesecmail_get_message_detail(login, domain, message_id):
     return resp.json()
 
 
-def create_temp_email(domain=None):
-    """يحاول mail.tm أولاً (بالدومين المحدد إن وُجد)، وإن فشل يتحول تلقائيًا إلى 1secmail."""
+def create_temp_email():
+    """يحاول mail.tm أولاً، وإن فشل يتحول تلقائيًا إلى 1secmail."""
     try:
-        return _mailtm_create_account(domain)
+        return _mailtm_create_account()
     except Exception as e:
         print(f"[mail.tm] فشل الإنشاء، التحويل إلى 1secmail: {e}")
         return _onesecmail_create_account()
@@ -484,51 +345,6 @@ def extract_main_link(body: str):
             continue
         return link.rstrip(").,")
     return None
-
-
-def build_incoming_message_text(read_msg):
-    """يبني نص رسالة جديدة منسّق (كود/رابط/نص). يُستخدم في الفحص اليدوي والمراقبة التلقائية معًا."""
-    sender = read_msg.get('from', 'غير معروف')
-    if isinstance(sender, dict):  # mail.tm يعيد from كـ {address, name}
-        sender = sender.get('address', 'غير معروف')
-    subject = read_msg.get('subject', 'بدون عنوان')
-    raw_body = read_msg.get('textBody') or read_msg.get('text') or ''
-    if isinstance(raw_body, list):  # بعض الحقول قد تأتي كقائمة
-        raw_body = "\n".join(raw_body)
-
-    code = extract_verification_code(subject, raw_body)
-    link = extract_main_link(raw_body)
-
-    parts = [
-        "✉️ **رسالة جديدة**",
-        f"من: `{sender}`",
-        f"الموضوع: {subject}",
-        "",
-    ]
-    if code:
-        parts.append(f"🔑 كود التحقق:  `{code}`")
-    if link:
-        parts.append(f"🔗 [رابط التحقق]({link})")
-
-    # نعرض النص الكامل فقط إذا لم نجد كود أو رابط (حالة نادرة) لتفادي الحشو
-    if not code and not link:
-        clean_body = clean_message_body(raw_body, max_len=500)
-        if clean_body:
-            parts.append(clean_body)
-
-    msg_text = "\n".join(parts).strip()
-    if len(msg_text) > 4000:
-        msg_text = msg_text[:4000].rstrip() + "…"
-    return msg_text
-
-
-def send_message_safe(chat_id, text):
-    """يرسل برسالة Markdown، وإن فشل (رموز تكسر التنسيق) يعيد المحاولة كنص عادي."""
-    try:
-        bot.send_message(chat_id, text, parse_mode="Markdown", disable_web_page_preview=True)
-    except Exception as e:
-        print(f"[send_message_safe] فشل الإرسال بتنسيق Markdown، إعادة المحاولة كنص عادي: {e}")
-        bot.send_message(chat_id, text, disable_web_page_preview=True)
 
 
 # ================= قواعد البيانات المؤقتة =================
@@ -603,28 +419,6 @@ def build_welcome_keyboard():
     return RawMarkup(keyboard)
 
 
-def build_domain_keyboard():
-    """لوحة اختيار الدومين (ميزة الدومين المخصص) + خيار عشوائي."""
-    try:
-        domains = mailtm_list_domains()[:6]
-    except Exception as e:
-        print(f"[build_domain_keyboard] تعذر جلب الدومينات: {e}")
-        domains = []
-
-    rows = []
-    pair = []
-    for d in domains:
-        pair.append({"text": f"@{d}", "callback_data": f"pick_domain:{d}", "style": "primary"})
-        if len(pair) == 2:
-            rows.append(pair)
-            pair = []
-    if pair:
-        rows.append(pair)
-    rows.append([{"text": "🎲 عشوائي", "callback_data": "pick_domain:random", "style": "success"}])
-
-    return RawMarkup({"inline_keyboard": rows})
-
-
 def show_main_menu(chat_id, user_id, first_name=None):
     """
     يعرض القائمة الرئيسية للبوت مباشرة لصاحب user_id/chat_id المحددين.
@@ -691,27 +485,11 @@ def callback_query(call):
             bot.answer_callback_query(call.id, "❌ لم تشترك في القناة بعد!", show_alert=True)
 
     elif call.data == "generate_email":
-        # بدل الإنشاء المباشر، نعرض اختيار الدومين أولًا (ميزة الدومين المخصص)
-        try:
-            bot.edit_message_text(
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                text="📬 اختر الدومين الذي تريد إنشاء بريدك عليه:",
-                reply_markup=build_domain_keyboard(),
-            )
-        except Exception as e:
-            print(f"[generate_email] تعذر عرض لوحة الدومين: {e}")
-            bot.send_message(call.message.chat.id, "📬 اختر الدومين الذي تريد إنشاء بريدك عليه:", reply_markup=build_domain_keyboard())
-
-    elif call.data.startswith("pick_domain:"):
         log_request(user_id, "generate_email")
-        chosen = call.data.split(":", 1)[1]
-        domain = None if chosen == "random" else chosen
-
         try:
-            mailbox = create_temp_email(domain)
+            mailbox = create_temp_email()
         except Exception as e:
-            print(f"[pick_domain] فشل كل مزودي الخدمة: {e}")
+            print(f"[generate_email] فشل كل مزودي الخدمة: {e}")
             bot.answer_callback_query(
                 call.id,
                 "❌ تعذر إنشاء البريد حاليًا (كل الخدمات معطلة مؤقتًا)، حاول بعد قليل.",
@@ -719,9 +497,8 @@ def callback_query(call):
             )
             return
 
-        user_emails[user_id] = mailbox  # تخزين سريع بالذاكرة
-        save_active_mailbox(user_id, mailbox)  # حفظ دائم بـ Turso يبقى بعد إعادة تشغيل السيرفر
-        clear_seen(user_id)  # بريد جديد = صندوق وارد فارغ
+        user_emails[user_id] = mailbox  # حفظ بيانات البريد الكاملة (بما فيها التوكن إن وجد)
+        user_seen_messages[user_id] = set()  # تصفير قائمة الرسائل المعروضة سابقًا مع كل بريد جديد
         email = mailbox["address"]
 
         markup = InlineKeyboardMarkup()
@@ -734,8 +511,7 @@ def callback_query(call):
             f"📧 `{email}`\n"
             "(اضغط على البريد لنسخه)\n\n"
             "1️⃣ استخدم هذا البريد للتسجيل في أي موقع\n"
-            "2️⃣ اضغط \"فحص صندوق الوارد\" لاستقبال الرسائل ورموز التحقق\n"
-            "🔔 أو فقط انتظر — سيصلك أي كود جديد تلقائيًا بدون أي ضغط"
+            "2️⃣ اضغط \"فحص صندوق الوارد\" لاستقبال الرسائل ورموز التحقق"
         )
 
         # تعديل الرسالة السابقة بدلاً من إرسال رسالة جديدة لتجربة مستخدم أفضل
@@ -743,10 +519,12 @@ def callback_query(call):
 
     elif call.data == "check_inbox":
         log_request(user_id, "check_inbox")
-        mailbox = get_mailbox(user_id)
-        if not mailbox:
+        if user_id not in user_emails:
             bot.answer_callback_query(call.id, "⚠️ لم تقم بإنشاء بريد بعد!", show_alert=True)
             return
+            
+        mailbox = user_emails[user_id]
+        email = mailbox["address"]
 
         # فحص الرسائل
         try:
@@ -762,7 +540,7 @@ def callback_query(call):
             bot.answer_callback_query(call.id, "📭 صندوق الوارد فارغ. لم تصل أي رسائل بعد.", show_alert=True)
             return
 
-        seen = get_seen_set(user_id)
+        seen = user_seen_messages.setdefault(user_id, set())
         new_messages = [msg for msg in req if msg['id'] not in seen]
 
         if not new_messages:
@@ -773,15 +551,54 @@ def callback_query(call):
 
         bot.answer_callback_query(call.id, "📬 توجد رسائل جديدة!", show_alert=False)
         for msg in new_messages:
-            mark_message_seen(user_id, msg['id'])  # وضع علامة "تم عرضها" فورًا (بالذاكرة + Turso) لتفادي التكرار
+            msg_id = msg['id']
+            seen.add(msg_id)  # وضع علامة "تم عرضها" فورًا لتفادي التكرار
+            # جلب محتوى الرسالة
             try:
-                read_msg = get_message_detail(mailbox, msg['id'])
+                read_msg = get_message_detail(mailbox, msg_id)
             except Exception as e:
                 print(f"[check_inbox] readMessage error: {e}")
-                bot.send_message(user_id, "⚠️ تعذر جلب محتوى رسالة.")
+                bot.send_message(user_id, f"⚠️ تعذر جلب محتوى رسالة.")
                 continue
 
-            send_message_safe(user_id, build_incoming_message_text(read_msg))
+            sender = read_msg.get('from', 'غير معروف')
+            if isinstance(sender, dict):  # mail.tm يعيد from كـ {address, name}
+                sender = sender.get('address', 'غير معروف')
+            subject = read_msg.get('subject', 'بدون عنوان')
+            raw_body = read_msg.get('textBody') or read_msg.get('text') or ''
+            if isinstance(raw_body, list):  # بعض الحقول قد تأتي كقائمة
+                raw_body = "\n".join(raw_body)
+
+            code = extract_verification_code(subject, raw_body)
+            link = extract_main_link(raw_body)
+
+            parts = [
+                "✉️ **رسالة جديدة**",
+                f"من: `{sender}`",
+                f"الموضوع: {subject}",
+                "",
+            ]
+            if code:
+                parts.append(f"🔑 كود التحقق:  `{code}`")
+            if link:
+                parts.append(f"🔗 [رابط التحقق]({link})")
+
+            # نعرض النص الكامل فقط إذا لم نجد كود أو رابط (حالة نادرة) لتفادي الحشو
+            if not code and not link:
+                clean_body = clean_message_body(raw_body, max_len=500)
+                if clean_body:
+                    parts.append(clean_body)
+
+            msg_text = "\n".join(parts).strip()
+            if len(msg_text) > 4000:
+                msg_text = msg_text[:4000].rstrip() + "…"
+
+            try:
+                bot.send_message(user_id, msg_text, parse_mode="Markdown", disable_web_page_preview=True)
+            except Exception as e:
+                # قد يحتوي محتوى البريد على رموز (* _ ` إلخ) تكسر تنسيق Markdown
+                print(f"[check_inbox] فشل الإرسال بتنسيق Markdown، إعادة المحاولة كنص عادي: {e}")
+                bot.send_message(user_id, msg_text, disable_web_page_preview=True)
 
     elif call.data == "refresh_stats":
         if user_id != ADMIN_ID:
@@ -959,45 +776,6 @@ def general_text_handler(message):
     # أي رسالة نصية أخرى من مستخدم عادي: لا شيء (تفادي إزعاج المستخدم بردود غير ضرورية)
 
 
-# ================= المراقبة التلقائية للوارد (إشعار فوري بدون ضغط المستخدم) =================
-AUTO_CHECK_INTERVAL = 25  # ثواني بين كل دورة فحص تلقائي لكل البريد النشط
-
-
-def auto_notify_loop():
-    """يفحص كل البريد النشط (من Turso) بالخلفية دوريًا، ويرسل أي رسالة جديدة تلقائيًا."""
-    while True:
-        time.sleep(AUTO_CHECK_INTERVAL)
-        try:
-            mailboxes = get_all_active_mailboxes()
-        except Exception as e:
-            print(f"[auto_notify_loop] تعذر جلب قائمة البريد النشط: {e}")
-            continue
-
-        for user_id, mailbox in mailboxes:
-            try:
-                messages = get_inbox(mailbox)
-            except Exception as e:
-                print(f"[auto_notify_loop] تعذر فحص بريد المستخدم {user_id}: {e}")
-                continue
-
-            if not messages:
-                continue
-
-            seen = get_seen_set(user_id)
-            new_messages = [m for m in messages if m['id'] not in seen]
-
-            for msg in new_messages:
-                mark_message_seen(user_id, msg['id'])
-                try:
-                    read_msg = get_message_detail(mailbox, msg['id'])
-                except Exception as e:
-                    print(f"[auto_notify_loop] تعذر جلب محتوى رسالة للمستخدم {user_id}: {e}")
-                    continue
-                send_message_safe(user_id, build_incoming_message_text(read_msg))
-
-            time.sleep(0.3)  # تأخير بسيط بين كل مستخدم وآخر لتفادي ضغط زائد على APIs الخارجية
-
-
 # ================= تشغيل البوت والخادم =================
 def setup_bot_commands():
     """يسجل قائمة الأوامر التي تظهر لما يكتب المستخدم / بتيليجرام."""
@@ -1008,11 +786,7 @@ def setup_bot_commands():
     admin_commands = public_commands + [
         BotCommand("stats", "📊 إحصائيات البوت (أدمن)"),
     ]
-    try:
-        bot.set_my_commands(public_commands)  # القائمة الافتراضية لكل المستخدمين
-    except Exception as e:
-        print(f"[setup_bot_commands] تعذر تسجيل القائمة العامة: {e}")
-
+    bot.set_my_commands(public_commands)  # القائمة الافتراضية لكل المستخدمين
     try:
         # قائمة أوسع (فيها /stats) تظهر فقط للأدمن، بدون ما تنكشف لبقية المستخدمين
         bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(ADMIN_ID))
@@ -1023,14 +797,7 @@ def setup_bot_commands():
 if __name__ == "__main__":
     # ملاحظة: keep_alive() تم استدعاؤه بالفعل بأعلى الملف فور تشغيله (قبل Turso)،
     # عشان ريندر يكتشف البورت المفتوح بسرعة ولا يعلّق الديبلوي.
-    try:
-        setup_bot_commands()
-    except Exception as e:
-        # أي عطل هنا لا يجوز أن يمنع البوت من بدء الاستماع للرسائل إطلاقًا
-        print(f"[main] تعذر تسجيل قائمة الأوامر: {e}")
-
-    # تشغيل مراقبة الوارد التلقائية بالخلفية (ميزة الإشعار الفوري)
-    threading.Thread(target=auto_notify_loop, daemon=True).start()
+    setup_bot_commands()
 
     print("Bot is running...")
     # تشغيل البوت
