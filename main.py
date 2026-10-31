@@ -568,7 +568,7 @@ def is_rate_limited(user_id):
 import json
 
 
-class RawMarkup:
+class RawMarkup(telebot.types.JsonSerializable):
     """
     غلاف بسيط لإرسال لوحة أزرار بصيغة JSON خام تدعم حقل الألوان
     (style: primary/success/danger) الذي أضافته تيليجرام حديثًا، والذي لا
@@ -578,6 +578,9 @@ class RawMarkup:
     """
     def __init__(self, keyboard_dict):
         self._keyboard_dict = keyboard_dict
+
+    def to_dict(self):
+        return self._keyboard_dict
 
     def to_json(self):
         return json.dumps(self._keyboard_dict)
