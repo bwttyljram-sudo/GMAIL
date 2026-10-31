@@ -110,6 +110,35 @@ def init_db():
             created_at TEXT
         )
     """)
+    # إعدادات البوت القابلة للتحكم من لوحة الأدمن (مفتاح/قيمة)
+    db_execute("CREATE TABLE IF NOT EXISTS bot_settings (k TEXT PRIMARY KEY, v TEXT)")
+    # سجل الإذاعات + الرسائل المرسلة لكل مستخدم (لإمكانية حذف الإذاعة من عند الجميع)
+    db_execute("""
+        CREATE TABLE IF NOT EXISTS broadcasts (
+            id INTEGER PRIMARY KEY,
+            created_at TEXT,
+            total INTEGER,
+            sent INTEGER,
+            failed INTEGER,
+            status TEXT
+        )
+    """)
+    db_execute("""
+        CREATE TABLE IF NOT EXISTS broadcast_msgs (
+            bid INTEGER,
+            user_id INTEGER,
+            message_id INTEGER
+        )
+    """)
+    # سجل أخطاء البوت
+    db_execute("""
+        CREATE TABLE IF NOT EXISTS error_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT,
+            location TEXT,
+            message TEXT
+        )
+    """)
     # الرسائل التي تم عرضها مسبقًا، محفوظة بشكل دائم لتفادي إعادة إرسالها بعد إعادة التشغيل
     db_execute("""
         CREATE TABLE IF NOT EXISTS seen_messages (
@@ -118,6 +147,84 @@ def init_db():
             PRIMARY KEY (user_id, message_id)
         )
     """)
+
+
+# ================= إعدادات البوت (قابلة للتعديل من لوحة الأدمن) + سجل الأخطاء =================
+DEFAULT_SETTINGS = {
+    "maintenance": "0",    # وضع الصيانة
+    "force_sub": "1",      # الاشتراك الإجباري
+    "auto_notify": "1",    # الإشعار التلقائي للوارد
+    "auto_interval": "25", # ثواني بين كل دورة فحص تلقائي
+    "rate_limit": "3",     # ثواني بين ضغطات الأزرار
+    "max_saved": "20",     # أقصى عدد بريد محفوظ لكل مستخدم
+    "welcome_text": "",    # رسالة ترحيب مخصصة (فارغ = الافتراضية)
+}
+_settings_cache = {}
+
+
+def load_settings():
+    """يحمّل الإعدادات من Turso للذاكرة (تُستدعى مرة عند التشغيل)."""
+    try:
+        for k, v in db_execute("SELECT k, v FROM bot_settings").rows:
+            _settings_cache[k] = v
+    except Exception as e:
+        print(f"[load_settings] {e}")
+
+
+def get_setting(key):
+    """القراءة دائمًا من الذاكرة (سريعة ولا تعلّق أبدًا). القيمة الفارغة = الافتراضي."""
+    v = _settings_cache.get(key)
+    if v is None or v == "":
+        return DEFAULT_SETTINGS.get(key, "")
+    return v
+
+
+def get_bool(key):
+    return str(get_setting(key)) == "1"
+
+
+def get_int(key):
+    try:
+        return int(get_setting(key))
+    except Exception:
+        return int(DEFAULT_SETTINGS.get(key, 0) or 0)
+
+
+def set_setting(key, value):
+    value = "" if value is None else str(value)
+    _settings_cache[key] = value
+    try:
+        db_execute("DELETE FROM bot_settings WHERE k = ?", [key])
+        if value != "":
+            db_execute("INSERT INTO bot_settings (k, v) VALUES (?, ?)", [key, value])
+    except Exception as e:
+        print(f"[set_setting] {e}")
+
+
+def log_error(where, err):
+    """يسجل خطأ بسجل الأخطاء (يُعرض بلوحة الأدمن). يعمل بخيط منفصل حتى لا يعلّق شيئًا."""
+    msg = f"{type(err).__name__}: {err}"[:500]
+    print(f"[ERROR:{where}] {msg}")
+
+    def _w():
+        try:
+            db_execute(
+                "INSERT INTO error_log (created_at, location, message) VALUES (?, ?, ?)",
+                [datetime.utcnow().isoformat(), where, msg],
+            )
+        except Exception:
+            pass
+    threading.Thread(target=_w, daemon=True).start()
+
+
+class _ExceptionLogger:
+    """يلتقط أي خطأ يحدث داخل معالجات تيليجرام ويسجله بدل أن يضيع."""
+    def handle(self, exception):
+        log_error("telebot", exception)
+        return True
+
+
+bot.exception_handler = _ExceptionLogger()
 
 
 def track_user(user_id, username=None):
@@ -247,25 +354,45 @@ def get_all_active_mailboxes():
         return []
 
 
+def count_saved_mailboxes(user_id):
+    try:
+        return db_execute("SELECT COUNT(*) FROM saved_mailboxes WHERE user_id = ?", [user_id]).rows[0][0]
+    except Exception:
+        return 0
+
+
 def save_mailbox_history(user_id, mailbox):
-    """يضيف البريد لسجل المستخدم الدائم (لا يكرر نفس العنوان)."""
+    """يحفظ البريد (اختياريًا بضغطة المستخدم). يرجع: saved / exists / full / error."""
     try:
         exists = db_execute(
             "SELECT id FROM saved_mailboxes WHERE user_id = ? AND address = ?", [user_id, mailbox.get("address")]
         ).rows
         if exists:
-            return
+            return "exists"
+        if count_saved_mailboxes(user_id) >= get_int("max_saved"):
+            return "full"
         db_execute(
             "INSERT INTO saved_mailboxes (user_id, provider, address, password, token, login, domain, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             [user_id, mailbox.get("provider"), mailbox.get("address"), mailbox.get("password"),
              mailbox.get("token"), mailbox.get("login"), mailbox.get("domain"), datetime.utcnow().isoformat()],
         )
+        return "saved"
     except Exception as e:
-        print(f"[save_mailbox_history] {e}")
+        log_error("save_mailbox_history", e)
+        return "error"
 
 
-def list_saved_mailboxes(user_id, limit=10):
+def delete_saved_mailbox(user_id, row_id):
+    try:
+        db_execute("DELETE FROM saved_mailboxes WHERE user_id = ? AND id = ?", [user_id, row_id])
+        return True
+    except Exception as e:
+        log_error("delete_saved_mailbox", e)
+        return False
+
+
+def list_saved_mailboxes(user_id, limit=50):
     try:
         rows = db_execute(
             "SELECT id, address FROM saved_mailboxes WHERE user_id = ? ORDER BY id DESC LIMIT ?", [user_id, limit]
@@ -369,6 +496,7 @@ def _init_db_safe():
     """ينشئ جداول Turso في Thread منفصل حتى لو تأخر الاتصال أو فشل، بدون ما يعلّق تشغيل البوت."""
     try:
         init_db()
+        load_settings()
         print("[Turso] تم الاتصال بقاعدة البيانات وإنشاء الجداول بنجاح.")
     except Exception as e:
         print(f"[Turso] تعذر الاتصال بقاعدة البيانات: {e}")
@@ -599,7 +727,7 @@ admin_waiting_broadcast = {"active": False} # حالة انتظار رسالة �
 
 # 1. التحقق من الاشتراك الإجباري
 def check_subscription(user_id):
-    if user_id == ADMIN_ID: # تجاوز الأدمن من الفحص
+    if user_id == ADMIN_ID or not get_bool("force_sub"): # تجاوز الأدمن + خيار إيقاف الاشتراك الإجباري
         return True
     try:
         status = bot.get_chat_member(CHANNEL_USERNAME, user_id).status
@@ -615,7 +743,7 @@ def is_rate_limited(user_id):
     current_time = time.time()
     if user_id in user_last_action:
         # السماح بطلب واحد كل 3 ثوانٍ لحماية السيرفر
-        if current_time - user_last_action[user_id] < 3:
+        if current_time - user_last_action[user_id] < get_int("rate_limit"):
             return True
     user_last_action[user_id] = current_time
     return False
@@ -644,14 +772,48 @@ class RawMarkup(telebot.types.JsonSerializable):
         return json.dumps(self._keyboard_dict)
 
 
-def btn(text, style, callback_data=None, url=None):
-    """زر ملوّن. style: primary (أزرق) / success (أخضر) / danger (أحمر). كل أزرار البوت تمر من هنا."""
-    b = {"text": text, "style": style}
+# سجل أزرار البوت: المفتاح -> (الاسم الظاهر بلوحة الأدمن، اللون الافتراضي). اللون يتغير من لوحة الأدمن.
+BUTTON_KEYS = {
+    "create_email": ("📨 إنشاء بريد عشوائي", "primary"),
+    "my_emails": ("📚 بريداتي المحفوظة", "success"),
+    "channel": ("📢 قناة البوت", "primary"),
+    "join": ("📢 انضم إلى القناة", "primary"),
+    "verify": ("✅ زر التحقق", "success"),
+    "inbox": ("🔄 فحص الوارد", "primary"),
+    "change": ("🗑️ تغيير البريد", "danger"),
+    "save": ("💾 حفظ هذا البريد", "success"),
+    "back": ("🔙 رجوع", "danger"),
+    "domain": ("@ أزرار الدومينات", "primary"),
+    "random": ("🎲 عشوائي", "success"),
+    "use_mail": ("📧 زر البريد المحفوظ", "primary"),
+    "del_mail": ("🗑 زر حذف البريد المحفوظ", "danger"),
+}
+STYLE_NAMES = {"primary": "🔵 أزرق", "success": "🟢 أخضر", "danger": "🔴 أحمر", "none": "⚪ بدون لون"}
+
+
+def get_style(key):
+    """لون الزر الحالي: المخصص من لوحة الأدمن، وإلا الافتراضي."""
+    custom = _settings_cache.get("style:" + key)
+    if custom in STYLE_NAMES:
+        return custom
+    return BUTTON_KEYS[key][1] if key in BUTTON_KEYS else "primary"
+
+
+def fbtn(text, style, callback_data=None, url=None):
+    """زر بلون ثابت (يُستخدم في لوحة الأدمن). style=None أو 'none' = بدون لون."""
+    b = {"text": text}
+    if style and style != "none":
+        b["style"] = style
     if url:
         b["url"] = url
     else:
         b["callback_data"] = callback_data
     return b
+
+
+def btn(key, text, callback_data=None, url=None):
+    """زر ملوّن حسب إعدادات الأدمن. كل أزرار المستخدمين تمر من هنا."""
+    return fbtn(text, get_style(key), callback_data=callback_data, url=url)
 
 
 def colored(rows):
@@ -663,24 +825,25 @@ CHANNEL_URL = f"https://t.me/{CHANNEL_USERNAME[1:]}"
 
 def build_subscribe_keyboard():
     return colored([
-        [btn("📢 انضم إلى قناة البوت", "primary", url=CHANNEL_URL)],
-        [btn("✅ زر التحقق", "success", callback_data="check_sub")],
+        [btn("join", "📢 انضم إلى قناة البوت", url=CHANNEL_URL)],
+        [btn("verify", "✅ زر التحقق", callback_data="check_sub")],
     ])
 
 
 def build_welcome_keyboard():
     return colored([
-        [btn("📨 إنشاء بريد عشوائي", "primary", callback_data="generate_email")],
-        [btn("📚 بريداتي المحفوظة", "success", callback_data="my_emails")],
-        [btn("📢 قناة البوت", "primary", url=CHANNEL_URL)],
+        [btn("create_email", "📨 إنشاء بريد عشوائي", callback_data="generate_email")],
+        [btn("my_emails", "📚 بريداتي المحفوظة", callback_data="my_emails")],
+        [btn("channel", "📢 قناة البوت", url=CHANNEL_URL)],
     ])
 
 
 def build_mailbox_keyboard():
     return colored([
-        [btn("🔄 فحص صندوق الوارد", "primary", callback_data="check_inbox")],
-        [btn("🗑️ تغيير البريد", "danger", callback_data="generate_email")],
-        [btn("📚 بريداتي المحفوظة", "success", callback_data="my_emails")],
+        [btn("inbox", "🔄 فحص صندوق الوارد", callback_data="check_inbox")],
+        [btn("save", "💾 حفظ هذا البريد", callback_data="save_mail"),
+         btn("change", "🗑️ تغيير البريد", callback_data="generate_email")],
+        [btn("my_emails", "📚 بريداتي المحفوظة", callback_data="my_emails")],
     ])
 
 
@@ -692,7 +855,8 @@ def build_mailbox_text(email, title="✅ **تم إنشاء بريدك بنجاح
         "(اضغط على البريد لنسخه)\n\n"
         "1️⃣ استخدم هذا البريد للتسجيل في أي موقع\n"
         "2️⃣ اضغط \"فحص صندوق الوارد\" لاستقبال الرسائل ورموز التحقق\n"
-        "🔔 أو فقط انتظر — سيصلك أي كود جديد تلقائيًا بدون أي ضغط"
+        "🔔 أو فقط انتظر — سيصلك أي كود جديد تلقائيًا بدون أي ضغط\n"
+        "💾 اضغط \"حفظ هذا البريد\" إن أردت الاحتفاظ به"
     )
 
 
@@ -706,21 +870,34 @@ def build_domain_keyboard():
 
     rows, pair = [], []
     for d in domains:
-        pair.append(btn(f"@{d}", "primary", callback_data=f"pick_domain:{d}"))
+        pair.append(btn("domain", f"@{d}", callback_data=f"pick_domain:{d}"))
         if len(pair) == 2:
             rows.append(pair)
             pair = []
     if pair:
         rows.append(pair)
-    rows.append([btn("🎲 عشوائي", "success", callback_data="pick_domain:random")])
-    rows.append([btn("🔙 رجوع", "danger", callback_data="back_menu")])
+    rows.append([btn("random", "🎲 عشوائي", callback_data="pick_domain:random")])
+    rows.append([btn("back", "🔙 رجوع", callback_data="back_menu")])
     return colored(rows)
 
 
 def build_my_emails_keyboard(user_id):
-    rows = [[btn(f"📧 {addr}", "primary", callback_data=f"use_mail:{rid}")] for rid, addr in list_saved_mailboxes(user_id)]
-    rows.append([btn("🔙 رجوع", "danger", callback_data="back_menu")])
+    rows = []
+    for rid, addr in list_saved_mailboxes(user_id):
+        rows.append([
+            btn("use_mail", f"📧 {addr}", callback_data=f"use_mail:{rid}"),
+            btn("del_mail", "🗑", callback_data=f"del_mail:{rid}"),
+        ])
+    rows.append([btn("back", "🔙 رجوع", callback_data="back_menu")])
     return colored(rows)
+
+
+def my_emails_text(user_id):
+    n = count_saved_mailboxes(user_id)
+    mx = get_int("max_saved")
+    if n == 0:
+        return "📭 لا يوجد لديك بريد محفوظ.\nأنشئ بريدًا ثم اضغط \"💾 حفظ هذا البريد\"."
+    return f"📚 **بريداتك المحفوظة** ({n}/{mx})\nاضغط على البريد لتفعيله، أو 🗑 لحذفه:"
 
 
 def show_main_menu(chat_id, user_id, first_name=None):
@@ -730,6 +907,10 @@ def show_main_menu(chat_id, user_id, first_name=None):
     سواء استُدعيت من أمر /start مباشرة أو من زر "التحقق" بعد الاشتراك.
     """
     markup = build_welcome_keyboard()
+    custom = get_setting("welcome_text")
+    if custom:
+        bot.send_message(chat_id, custom, reply_markup=markup)  # نص مخصص من الأدمن (بدون تنسيق لتفادي الأخطاء)
+        return
     welcome_text = (
         "👋 **أهلًا بك في بوت GMAIL**\n\n"
         "1️⃣ إنشاء بريد عشوائي\n"
@@ -751,7 +932,7 @@ def _bg_track_start(user_id, username):
 
 def _report_error_to_admin(where, user_id, err):
     """يرسل سبب الفشل الحقيقي للأدمن في المحادثة (تشخيص بدون الحاجة لسجلات Render)."""
-    print(f"[{where}] user={user_id} خطأ: {repr(err)}")
+    log_error(where, err)
     try:
         bot.send_message(ADMIN_ID, f"⚠️ خطأ في {where}\nالمستخدم: {user_id}\n{type(err).__name__}: {err}"[:3500])
     except Exception as e2:
@@ -762,6 +943,10 @@ def _report_error_to_admin(where, user_id, err):
 def send_welcome(message):
     user_id = message.from_user.id
     print(f"[start] وصل أمر /start من {user_id}")
+
+    if get_bool("maintenance") and user_id != ADMIN_ID:
+        bot.send_message(message.chat.id, "🔧 البوت تحت الصيانة حاليًا، عد لاحقًا بإذن الله.")
+        return
 
     # 1) الرد أولًا — قبل أي قاعدة بيانات
     try:
@@ -807,7 +992,19 @@ def callback_query(call):
     # وليس call.message.from_user الذي يرجّع هوية البوت نفسه (لأن call.message
     # هو الرسالة التي أرسلها البوت) — هذا كان سبب خلل سابق بعد التحقق من الاشتراك.
     user_id = call.from_user.id
+
+    # لوحة تحكم الأدمن (كل أزرارها تبدأ بـ adm:)
+    if call.data == "refresh_stats":
+        call.data = "adm:stats"
+    if call.data.startswith("adm:"):
+        admin_callback(call)
+        return
+
     track_user(user_id, call.from_user.username)
+
+    if get_bool("maintenance") and user_id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "🔧 البوت تحت الصيانة حاليًا.", show_alert=True)
+        return
 
     # نظام الحماية من الضغط المستمر
     if is_rate_limited(user_id):
@@ -858,7 +1055,6 @@ def callback_query(call):
         user_emails[user_id] = mailbox  # تخزين سريع بالذاكرة
         save_active_mailbox(user_id, mailbox)  # حفظ دائم بـ Turso يبقى بعد إعادة تشغيل السيرفر
         clear_seen(user_id)  # بريد جديد = صندوق وارد فارغ
-        save_mailbox_history(user_id, mailbox)  # حفظه بسجل "بريداتي المحفوظة"
         email = mailbox["address"]
 
         markup = build_mailbox_keyboard()
@@ -868,14 +1064,43 @@ def callback_query(call):
         bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text=text, reply_markup=markup, parse_mode="Markdown")
 
     elif call.data == "my_emails":
-        saved = list_saved_mailboxes(user_id)
-        text = "📚 **بريداتك المحفوظة**\nاختر بريدًا لتفعيله وفحص صندوقه:" if saved else "📭 لا يوجد لديك بريد محفوظ بعد.\nأنشئ بريدًا وسيُحفظ هنا تلقائيًا."
         try:
             bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
-                                  text=text, reply_markup=build_my_emails_keyboard(user_id), parse_mode="Markdown")
+                                  text=my_emails_text(user_id), reply_markup=build_my_emails_keyboard(user_id),
+                                  parse_mode="Markdown")
         except Exception as e:
-            print(f"[my_emails] {e}")
-            bot.send_message(call.message.chat.id, text, reply_markup=build_my_emails_keyboard(user_id), parse_mode="Markdown")
+            log_error("my_emails", e)
+            bot.send_message(call.message.chat.id, my_emails_text(user_id),
+                             reply_markup=build_my_emails_keyboard(user_id), parse_mode="Markdown")
+
+    elif call.data == "save_mail":
+        mailbox = get_mailbox(user_id)
+        if not mailbox:
+            bot.answer_callback_query(call.id, "⚠️ لا يوجد بريد نشط لحفظه.", show_alert=True)
+            return
+        result = save_mailbox_history(user_id, mailbox)
+        mx = get_int("max_saved")
+        msgs = {
+            "saved": f"✅ تم حفظ البريد ({count_saved_mailboxes(user_id)}/{mx})",
+            "exists": "ℹ️ هذا البريد محفوظ مسبقًا.",
+            "full": f"⚠️ وصلت للحد الأقصى ({mx} بريد). احذف بريدًا من \"بريداتي المحفوظة\" ثم أعد المحاولة.",
+            "error": "❌ تعذر الحفظ حاليًا، حاول لاحقًا.",
+        }
+        bot.answer_callback_query(call.id, msgs[result], show_alert=(result in ("full", "error")))
+
+    elif call.data.startswith("del_mail:"):
+        try:
+            row_id = int(call.data.split(":", 1)[1])
+        except ValueError:
+            return
+        ok = delete_saved_mailbox(user_id, row_id)
+        bot.answer_callback_query(call.id, "🗑 تم حذف البريد" if ok else "❌ تعذر الحذف")
+        try:
+            bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
+                                  text=my_emails_text(user_id), reply_markup=build_my_emails_keyboard(user_id),
+                                  parse_mode="Markdown")
+        except Exception as e:
+            log_error("del_mail", e)
 
     elif call.data.startswith("use_mail:"):
         try:
@@ -953,25 +1178,6 @@ def callback_query(call):
 
             send_message_safe(user_id, build_incoming_message_text(read_msg))
 
-    elif call.data == "refresh_stats":
-        if user_id != ADMIN_ID:
-            bot.answer_callback_query(call.id, "🚫 هذا الزر للأدمن فقط.", show_alert=True)
-            return
-        try:
-            bot.edit_message_text(
-                format_stats_message(),
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                reply_markup=stats_keyboard(),
-                parse_mode="Markdown",
-            )
-            bot.answer_callback_query(call.id, "✅ تم التحديث")
-        except Exception as e:
-            # يحدث لو الإحصائيات نفسها لم تتغير منذ آخر تحديث (تيليجرام يرفض تعديل رسالة بنفس المحتوى)
-            bot.answer_callback_query(call.id, "ℹ️ لا يوجد جديد منذ آخر تحديث.")
-
-
-# ================= لوحة الأدمن: الإحصائيات =================
 
 def format_stats_message():
     s = get_stats()
@@ -1007,42 +1213,392 @@ def format_stats_message():
     return "\n".join(lines)
 
 
-def stats_keyboard():
-    return colored([[btn("🔄 تحديث الإحصائيات", "success", callback_data="refresh_stats")]])
+# ================= لوحة تحكم الأدمن (/settings) =================
+admin_state = {"mode": None, "pending": None}   # mode: await_broadcast / await_welcome
+broadcast_run = {"on": False, "stop": False}
 
 
-def run_broadcast(from_chat_id, from_message_id):
-    """يرسل رسالة (أي نوع محتوى) لكل مستخدمي البوت تدريجيًا لتفادي حظر تيليجرام للبوت."""
-    user_ids = get_all_user_ids()
-    sent, failed = 0, 0
-    for uid in user_ids:
-        try:
-            bot.copy_message(uid, from_chat_id, from_message_id)
-            sent += 1
-        except Exception:
-            failed += 1
-        time.sleep(0.07)  # تأخير بسيط بين كل رسالة لتفادي تجاوز حدود تيليجرام
+def progress_bar(done, total, width=12):
+    pct = 100 if total <= 0 else int(done * 100 / total)
+    filled = width if total <= 0 else int(width * done / total)
+    return "▓" * filled + "░" * (width - filled) + f" {pct}%"
+
+
+def adm_back(to="adm:main"):
+    return [fbtn("🔙 رجوع", "danger", callback_data=to)]
+
+
+def adm_main_text():
+    return (
+        "🛠️ لوحة تحكم البوت\n"
+        "━━━━━━━━━━━━━━\n"
+        f"🔧 الصيانة: {'مفعّلة' if get_bool('maintenance') else 'متوقفة'}\n"
+        f"📢 الاشتراك الإجباري: {'مفعّل' if get_bool('force_sub') else 'متوقف'}\n"
+        f"🔔 الإشعار التلقائي: {'مفعّل' if get_bool('auto_notify') else 'متوقف'}\n\n"
+        "اختر القسم:"
+    )
+
+
+def adm_main_kb():
+    return colored([
+        [fbtn("📊 الإحصائيات", "primary", "adm:stats"), fbtn("📢 الإذاعة", "primary", "adm:bc")],
+        [fbtn("⚙️ إعدادات البوت", "success", "adm:set"), fbtn("🎨 ألوان الأزرار", "success", "adm:colors")],
+        [fbtn("🐞 أخطاء البوت", "danger", "adm:err")],
+        [fbtn("❌ إغلاق", "danger", "adm:close")],
+    ])
+
+
+def adm_show(call, text, kb, md=False):
+    """يعدّل رسالة اللوحة. يتجاهل خطأ 'الرسالة لم تتغير'."""
     try:
-        bot.send_message(
-            ADMIN_ID,
-            f"✅ **اكتملت الإذاعة**\n\nتم الإرسال بنجاح لـ {sent} مستخدم.\nفشل الإرسال لـ {failed} (على الأغلب حظروا البوت).",
-            parse_mode="Markdown",
-        )
+        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id,
+                              reply_markup=kb, parse_mode="Markdown" if md else None)
+        return True
+    except Exception as e:
+        if "not modified" in str(e):
+            return False
+        log_error("adm_show", e)
+        try:
+            bot.send_message(call.message.chat.id, text, reply_markup=kb, parse_mode="Markdown" if md else None)
+        except Exception as e2:
+            log_error("adm_show/send", e2)
+        return True
+
+
+def adm_flag(key):
+    return "✅ مفعّل" if get_bool(key) else "⛔ متوقف"
+
+
+def adm_settings_kb():
+    return colored([
+        [fbtn(f"🔧 وضع الصيانة: {adm_flag('maintenance')}", "danger" if get_bool("maintenance") else "success", "adm:tg:maintenance")],
+        [fbtn(f"📢 الاشتراك الإجباري: {adm_flag('force_sub')}", "primary", "adm:tg:force_sub")],
+        [fbtn(f"🔔 الإشعار التلقائي: {adm_flag('auto_notify')}", "primary", "adm:tg:auto_notify")],
+        [fbtn(f"⏱ فاصل الفحص التلقائي: {get_int('auto_interval')} ث", "primary", "adm:cy:auto_interval")],
+        [fbtn(f"🛡 الحد بين الضغطات: {get_int('rate_limit')} ث", "primary", "adm:cy:rate_limit")],
+        [fbtn(f"💾 أقصى بريد محفوظ: {get_int('max_saved')}", "primary", "adm:cy:max_saved")],
+        [fbtn("✏️ تعديل رسالة الترحيب", "success", "adm:welcome")],
+        adm_back(),
+    ])
+
+
+CYCLE_VALUES = {
+    "auto_interval": [10, 25, 60, 120],
+    "rate_limit": [1, 3, 5, 10],
+    "max_saved": [10, 20, 30, 50],
+}
+
+
+def adm_colors_kb():
+    rows = []
+    for key, (label, _default) in BUTTON_KEYS.items():
+        rows.append([fbtn(f"{STYLE_NAMES[get_style(key)].split()[0]} {label}", get_style(key), f"adm:cl:{key}")])
+    rows.append([
+        fbtn("🔵 كل الأزرار", "primary", "adm:call:primary"),
+        fbtn("🟢 كل الأزرار", "success", "adm:call:success"),
+        fbtn("🔴 كل الأزرار", "danger", "adm:call:danger"),
+    ])
+    rows.append([fbtn("↩️ استرجاع كل الألوان الافتراضية", "none", "adm:call:default")])
+    rows.append(adm_back())
+    return colored(rows)
+
+
+def adm_color_pick_kb(key):
+    return colored([
+        [fbtn("🔵 أزرق", "primary", f"adm:cs:{key}:primary")],
+        [fbtn("🟢 أخضر", "success", f"adm:cs:{key}:success")],
+        [fbtn("🔴 أحمر", "danger", f"adm:cs:{key}:danger")],
+        [fbtn("⚪ بدون لون", "none", f"adm:cs:{key}:none")],
+        [fbtn("↩️ الافتراضي", "none", f"adm:cs:{key}:default")],
+        adm_back("adm:colors"),
+    ])
+
+
+def adm_broadcast_menu():
+    try:
+        rows = db_execute("SELECT id, created_at, sent, status FROM broadcasts ORDER BY id DESC LIMIT 5").rows
+    except Exception as e:
+        log_error("adm_broadcast_menu", e)
+        rows = []
+    kb = [[fbtn("📝 إذاعة جديدة", "success", "adm:bcnew")]]
+    lines = ["📢 الإذاعة", "━━━━━━━━━━━━━━", "أرسل أي رسالة (نص/صورة/فيديو/ملف/محوّلة من قناة) وتُذاع للجميع كما هي تمامًا.", ""]
+    if rows:
+        lines.append("آخر الإذاعات:")
+        for bid, created, sent, status in rows:
+            st = {"done": "✅ مكتملة", "running": "⏳ جارية", "stopped": "⏹ أوقفت", "deleted": "🗑 محذوفة"}.get(status, status)
+            lines.append(f"• #{str(created)[:16].replace('T', ' ')} — {sent} مستلم — {st}")
+            if status != "deleted":
+                kb.append([fbtn(f"🗑 حذف إذاعة {str(created)[5:16].replace('T', ' ')} من عند الجميع", "danger", f"adm:bcdelask:{bid}")])
+        lines.append("\n⚠️ تيليجرام يسمح بحذف رسائل البوت خلال 48 ساعة من إرسالها.")
+    else:
+        lines.append("لا توجد إذاعات سابقة.")
+    kb.append(adm_back())
+    return "\n".join(lines), colored(kb)
+
+
+def _flush_msgs(buf):
+    if not buf:
+        return
+    try:
+        ph = ",".join(["(?, ?, ?)"] * len(buf))
+        params = [x for row in buf for x in row]
+        db_execute(f"INSERT INTO broadcast_msgs (bid, user_id, message_id) VALUES {ph}", params)
+    except Exception as e:
+        log_error("flush_msgs", e)
+    buf.clear()
+
+
+def _edit_progress(chat_id, msg_id, text, kb=None):
+    try:
+        bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id, reply_markup=kb)
     except Exception:
         pass
 
 
-@bot.message_handler(commands=['stats'])
-def stats_command(message):
-    """أمر /stats بقائمة أوامر تيليجرام (للأدمن فقط)."""
-    user_id = message.from_user.id
-    track_user(user_id, message.from_user.username)
-    if user_id != ADMIN_ID:
-        return  # يتجاهل الطلب تمامًا لغير الأدمن دون أي رد
+def run_broadcast(from_chat, from_msg, admin_chat, prog_id):
+    """يذيع الرسالة كما هي (copy_message) لكل المستخدمين مع شريط تقدم، ويحفظ كل رسالة لإمكانية حذفها لاحقًا."""
+    broadcast_run.update(on=True, stop=False)
+    bid = int(time.time())
     try:
-        bot.reply_to(message, format_stats_message(), reply_markup=stats_keyboard(), parse_mode="Markdown")
+        users = get_all_user_ids()
     except Exception as e:
-        bot.reply_to(message, f"⚠️ تعذر جلب الإحصائيات حاليًا (مشكلة اتصال بقاعدة البيانات).\n`{e}`", parse_mode="Markdown")
+        log_error("run_broadcast/users", e)
+        users = []
+    total, sent, failed, buf = len(users), 0, 0, []
+    try:
+        db_execute("INSERT INTO broadcasts (id, created_at, total, sent, failed, status) VALUES (?, ?, ?, 0, 0, 'running')",
+                   [bid, datetime.utcnow().isoformat(), total])
+    except Exception as e:
+        log_error("run_broadcast/insert", e)
+    stop_kb = colored([[fbtn("⏹ إيقاف الإذاعة", "danger", "adm:bcstop")]])
+    last = 0.0
+    status = "done"
+    for i, uid in enumerate(users, 1):
+        if broadcast_run["stop"]:
+            status = "stopped"
+            break
+        try:
+            m = bot.copy_message(uid, from_chat, from_msg)
+            sent += 1
+            buf.append((bid, uid, m.message_id))
+        except Exception:
+            failed += 1
+        if len(buf) >= 40:
+            _flush_msgs(buf)
+        if time.time() - last > 2:
+            last = time.time()
+            _edit_progress(admin_chat, prog_id,
+                           f"🚀 جاري الإذاعة...\n{progress_bar(i, total)}\n({i}/{total})  ✅ {sent}  ❌ {failed}", stop_kb)
+        time.sleep(0.05)
+    _flush_msgs(buf)
+    try:
+        db_execute("UPDATE broadcasts SET sent = ?, failed = ?, status = ? WHERE id = ?", [sent, failed, status, bid])
+    except Exception as e:
+        log_error("run_broadcast/update", e)
+    title = "✅ اكتملت الإذاعة" if status == "done" else "⏹ تم إيقاف الإذاعة"
+    _edit_progress(admin_chat, prog_id,
+                   f"{title}\n{progress_bar(sent + failed, total)}\n✅ نجح: {sent}\n❌ فشل: {failed} (غالبًا حظروا البوت)",
+                   colored([[fbtn("🗑 حذف هذه الإذاعة من عند الجميع", "danger", f"adm:bcdelask:{bid}")],
+                            adm_back("adm:bc")]))
+    broadcast_run["on"] = False
+
+
+def delete_broadcast(bid, admin_chat, prog_id):
+    """يحذف الإذاعة من عند كل من استلمها مع شريط تقدم."""
+    try:
+        rows = db_execute("SELECT user_id, message_id FROM broadcast_msgs WHERE bid = ?", [bid]).rows
+    except Exception as e:
+        log_error("delete_broadcast/read", e)
+        rows = []
+    total, ok, fail, last = len(rows), 0, 0, 0.0
+    for i, (uid, mid) in enumerate(rows, 1):
+        try:
+            bot.delete_message(uid, mid)
+            ok += 1
+        except Exception:
+            fail += 1
+        if time.time() - last > 2:
+            last = time.time()
+            _edit_progress(admin_chat, prog_id, f"🗑 جاري الحذف من عند الجميع...\n{progress_bar(i, total)}\n({i}/{total})")
+        time.sleep(0.05)
+    try:
+        db_execute("DELETE FROM broadcast_msgs WHERE bid = ?", [bid])
+        db_execute("UPDATE broadcasts SET status = 'deleted' WHERE id = ?", [bid])
+    except Exception as e:
+        log_error("delete_broadcast/update", e)
+    _edit_progress(admin_chat, prog_id, f"✅ تم حذف الإذاعة\n{progress_bar(total, total)}\n🗑 حُذفت: {ok}\n⚠️ تعذر حذف: {fail} (قديمة أو حظروا البوت)",
+                   colored([adm_back("adm:bc")]))
+
+
+def format_errors_text():
+    try:
+        rows = db_execute("SELECT created_at, location, message FROM error_log ORDER BY id DESC LIMIT 10").rows
+    except Exception as e:
+        return f"تعذر قراءة السجل: {e}"
+    if not rows:
+        return "🐞 سجل الأخطاء\n━━━━━━━━━━━━━━\n✅ لا توجد أخطاء مسجلة."
+    out = ["🐞 آخر 10 أخطاء", "━━━━━━━━━━━━━━"]
+    for created, where, msg in rows:
+        out.append(f"🕐 {str(created)[5:19].replace('T', ' ')} UTC\n📍 {where}\n{msg}\n")
+    return "\n".join(out)[:3800]
+
+
+def admin_callback(call):
+    """يعالج كل أزرار لوحة الأدمن (adm:...)."""
+    if call.from_user.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "🚫 هذه اللوحة للأدمن فقط.", show_alert=True)
+        return
+    parts = call.data.split(":")
+    sec = parts[1] if len(parts) > 1 else "main"
+    chat_id, msg_id = call.message.chat.id, call.message.message_id
+
+    try:
+        if sec == "main":
+            admin_state["mode"] = None
+            adm_show(call, adm_main_text(), adm_main_kb())
+
+        elif sec == "close":
+            admin_state["mode"] = None
+            try:
+                bot.delete_message(chat_id, msg_id)
+            except Exception:
+                pass
+
+        elif sec == "stats":
+            changed = adm_show(call, format_stats_message(),
+                               colored([[fbtn("🔄 تحديث", "success", "adm:stats")], adm_back()]), md=True)
+            bot.answer_callback_query(call.id, "✅ تم التحديث" if changed else "ℹ️ لا جديد منذ آخر تحديث")
+            return
+
+        # ---------- الإذاعة ----------
+        elif sec == "bc":
+            admin_state["mode"] = None
+            text, kb = adm_broadcast_menu()
+            adm_show(call, text, kb)
+
+        elif sec == "bcnew":
+            if broadcast_run["on"]:
+                bot.answer_callback_query(call.id, "⏳ توجد إذاعة جارية حاليًا.", show_alert=True)
+                return
+            admin_state["mode"] = "await_broadcast"
+            adm_show(call, "📝 أرسل الآن المحتوى المراد إذاعته.\n\nيقبل: نص منسق، صورة، فيديو، ملف، صوت، ملصق، أو رسالة محوّلة من قناة — تُرسل للجميع كما هي تمامًا.",
+                     colored([[fbtn("❌ إلغاء", "danger", "adm:bc")]]))
+
+        elif sec == "bcgo":
+            pending = admin_state.get("pending")
+            if not pending:
+                bot.answer_callback_query(call.id, "⚠️ لا توجد رسالة جاهزة للإذاعة.", show_alert=True)
+                return
+            if broadcast_run["on"]:
+                bot.answer_callback_query(call.id, "⏳ توجد إذاعة جارية حاليًا.", show_alert=True)
+                return
+            admin_state["pending"] = None
+            adm_show(call, "🚀 جاري بدء الإذاعة...", None)
+            threading.Thread(target=run_broadcast, args=(pending[0], pending[1], chat_id, msg_id), daemon=True).start()
+
+        elif sec == "bcstop":
+            broadcast_run["stop"] = True
+            bot.answer_callback_query(call.id, "⏹ جاري الإيقاف...")
+            return
+
+        elif sec == "bcdelask":
+            bid = parts[2]
+            adm_show(call, "⚠️ هل تريد حذف هذه الإذاعة من عند جميع المستخدمين؟\nلا يمكن التراجع.",
+                     colored([[fbtn("✅ نعم، احذفها من عند الجميع", "danger", f"adm:bcdel:{bid}")],
+                              adm_back("adm:bc")]))
+
+        elif sec == "bcdel":
+            bid = int(parts[2])
+            adm_show(call, "🗑 جاري الحذف...", None)
+            threading.Thread(target=delete_broadcast, args=(bid, chat_id, msg_id), daemon=True).start()
+
+        # ---------- الإعدادات ----------
+        elif sec == "set":
+            admin_state["mode"] = None
+            adm_show(call, "⚙️ إعدادات البوت\nاضغط على أي خيار لتغييره فورًا:", adm_settings_kb())
+
+        elif sec == "tg":
+            key = parts[2]
+            if key in ("maintenance", "force_sub", "auto_notify"):
+                set_setting(key, "0" if get_bool(key) else "1")
+            adm_show(call, "⚙️ إعدادات البوت\nاضغط على أي خيار لتغييره فورًا:", adm_settings_kb())
+
+        elif sec == "cy":
+            key = parts[2]
+            vals = CYCLE_VALUES.get(key)
+            if vals:
+                cur = get_int(key)
+                nxt = vals[(vals.index(cur) + 1) % len(vals)] if cur in vals else vals[0]
+                set_setting(key, nxt)
+            adm_show(call, "⚙️ إعدادات البوت\nاضغط على أي خيار لتغييره فورًا:", adm_settings_kb())
+
+        elif sec == "welcome":
+            admin_state["mode"] = "await_welcome"
+            cur = get_setting("welcome_text") or "(الافتراضية)"
+            adm_show(call, f"✏️ أرسل الآن نص رسالة الترحيب الجديدة.\nأرسل كلمة: افتراضي — لإرجاع الرسالة الأصلية.\n\nالحالية:\n{cur}",
+                     colored([[fbtn("❌ إلغاء", "danger", "adm:set")]]))
+
+        # ---------- ألوان الأزرار ----------
+        elif sec == "colors":
+            adm_show(call, "🎨 ألوان الأزرار\nاختر زرًا لتغيير لونه (أو لوّن الكل دفعة واحدة):", adm_colors_kb())
+
+        elif sec == "cl":
+            key = parts[2]
+            if key in BUTTON_KEYS:
+                adm_show(call, f"🎨 {BUTTON_KEYS[key][0]}\nاللون الحالي: {STYLE_NAMES[get_style(key)]}\nاختر اللون الجديد:",
+                         adm_color_pick_kb(key))
+
+        elif sec == "cs":
+            key, val = parts[2], parts[3]
+            if key in BUTTON_KEYS:
+                set_setting("style:" + key, "" if val == "default" else val)
+                bot.answer_callback_query(call.id, "✅ تم تغيير اللون")
+                adm_show(call, f"🎨 {BUTTON_KEYS[key][0]}\nاللون الحالي: {STYLE_NAMES[get_style(key)]}\nاختر اللون الجديد:",
+                         adm_color_pick_kb(key))
+                return
+
+        elif sec == "call":
+            val = parts[2]
+            for key in BUTTON_KEYS:
+                set_setting("style:" + key, "" if val == "default" else val)
+            bot.answer_callback_query(call.id, "✅ تم تطبيق اللون على كل الأزرار")
+            adm_show(call, "🎨 ألوان الأزرار\nاختر زرًا لتغيير لونه (أو لوّن الكل دفعة واحدة):", adm_colors_kb())
+            return
+
+        # ---------- الأخطاء ----------
+        elif sec == "err":
+            changed = adm_show(call, format_errors_text(),
+                               colored([[fbtn("🔄 تحديث", "success", "adm:err"), fbtn("🧹 مسح السجل", "danger", "adm:errclear")],
+                                        adm_back()]))
+            bot.answer_callback_query(call.id, "✅ تم التحديث" if changed else "ℹ️ لا جديد")
+            return
+
+        elif sec == "errclear":
+            try:
+                db_execute("DELETE FROM error_log")
+            except Exception as e:
+                log_error("errclear", e)
+            adm_show(call, format_errors_text(),
+                     colored([[fbtn("🔄 تحديث", "success", "adm:err"), fbtn("🧹 مسح السجل", "danger", "adm:errclear")],
+                              adm_back()]))
+    except Exception as e:
+        log_error(f"admin_callback:{call.data}", e)
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+
+
+@bot.message_handler(commands=['settings', 'stats', 'broadcast', 'اعدادات', 'الاعدادات', 'اذاعة'])
+def settings_command(message):
+    """أمر الأدمن الوحيد: يفتح لوحة التحكم الكاملة."""
+    if message.from_user.id != ADMIN_ID:
+        return  # يتجاهل الطلب تمامًا لغير الأدمن دون أي رد
+    admin_state["mode"] = None
+    try:
+        bot.send_message(message.chat.id, adm_main_text(), reply_markup=adm_main_kb())
+    except Exception as e:
+        log_error("settings_command", e)
 
 
 def format_user_stats_message(user_id, first_name):
@@ -1079,60 +1635,53 @@ def my_stats_command(message):
         print(f"[my_stats_command] خطأ: {e}")
 
 
-@bot.message_handler(commands=['broadcast', 'اذاعة'])
-def broadcast_command(message):
+# ================= معالج عام (استقبال محتوى الإذاعة/الترحيب من الأدمن) =================
+ALL_CONTENT_TYPES = ['text', 'photo', 'video', 'document', 'animation', 'audio', 'voice',
+                     'sticker', 'video_note', 'poll', 'location', 'contact', 'venue', 'dice']
+
+
+@bot.message_handler(func=lambda m: True, content_types=ALL_CONTENT_TYPES)
+def general_handler(message):
     if message.from_user.id != ADMIN_ID:
-        return
-    admin_waiting_broadcast["active"] = True
-    bot.reply_to(
-        message,
-        "📢 **وضع الإذاعة مفعّل**\n\nأرسل الآن الرسالة (نص، صورة، فيديو...) التي تريد إذاعتها لكل مستخدمي البوت.",
-        parse_mode="Markdown",
-    )
+        return  # مستخدم عادي: لا شيء (تفادي إزعاجه بردود غير ضرورية)
 
+    mode = admin_state.get("mode")
 
-# ================= معالج النصوص العام (إحصائيات + استقبال محتوى الإذاعة) =================
-
-@bot.message_handler(func=lambda m: True, content_types=['text', 'photo', 'video', 'document', 'animation'])
-def general_text_handler(message):
-    user_id = message.from_user.id
-
-    # --- استقبال محتوى الإذاعة إن كان الأدمن في وضع الانتظار ---
-    if user_id == ADMIN_ID and admin_waiting_broadcast.get("active"):
-        admin_waiting_broadcast["active"] = False
-        bot.reply_to(message, "🚀 جاري إرسال الإذاعة لكل المستخدمين تدريجيًا...")
-        # تشغيل الإذاعة في Thread منفصل حتى لا تتوقف استجابة البوت للمستخدمين الآخرين أثناء الإرسال
-        threading.Thread(
-            target=run_broadcast,
-            kwargs={
-                "from_chat_id": message.chat.id,
-                "from_message_id": message.message_id,
-            },
-            daemon=True,
-        ).start()
-        return
-
-    # --- أمر الإحصائيات (نصي، للأدمن فقط) ---
-    if message.content_type == "text" and message.text.strip() in ["احصائيات", "إحصائيات"]:
-        if user_id != ADMIN_ID:
-            return  # يتجاهل الطلب تمامًا لغير الأدمن دون أي رد
+    if mode == "await_broadcast":
+        admin_state["mode"] = None
+        admin_state["pending"] = (message.chat.id, message.message_id)
         try:
-            bot.reply_to(message, format_stats_message(), reply_markup=stats_keyboard(), parse_mode="Markdown")
+            bot.copy_message(message.chat.id, message.chat.id, message.message_id)  # معاينة كما ستصل للمستخدمين
         except Exception as e:
-            bot.reply_to(message, f"⚠️ تعذر جلب الإحصائيات حاليًا (مشكلة اتصال بقاعدة البيانات).\n`{e}`", parse_mode="Markdown")
+            log_error("broadcast/preview", e)
+        bot.send_message(
+            message.chat.id,
+            "👆 هذه معاينة الإذاعة. هل تؤكد إرسالها لكل المستخدمين؟",
+            reply_markup=colored([[fbtn("✅ تأكيد وبدء الإذاعة", "success", "adm:bcgo")],
+                                  [fbtn("❌ إلغاء", "danger", "adm:bc")]]),
+        )
         return
 
-    # أي رسالة نصية أخرى من مستخدم عادي: لا شيء (تفادي إزعاج المستخدم بردود غير ضرورية)
+    if mode == "await_welcome" and message.content_type == "text":
+        admin_state["mode"] = None
+        new_text = message.text.strip()
+        set_setting("welcome_text", "" if new_text in ("افتراضي", "الافتراضي") else new_text)
+        bot.send_message(message.chat.id, "✅ تم تحديث رسالة الترحيب.", reply_markup=adm_settings_kb())
+        return
+
+    if message.content_type == "text" and message.text.strip() in ["احصائيات", "إحصائيات", "اعدادات", "إعدادات", "الاعدادات", "الإعدادات"]:
+        bot.send_message(message.chat.id, adm_main_text(), reply_markup=adm_main_kb())
 
 
 # ================= المراقبة التلقائية للوارد (إشعار فوري بدون ضغط المستخدم) =================
-AUTO_CHECK_INTERVAL = 25  # ثواني بين كل دورة فحص تلقائي لكل البريد النشط
 
 
 def auto_notify_loop():
     """يفحص كل البريد النشط (من Turso) بالخلفية دوريًا، ويرسل أي رسالة جديدة تلقائيًا."""
     while True:
-        time.sleep(AUTO_CHECK_INTERVAL)
+        time.sleep(get_int("auto_interval"))
+        if not get_bool("auto_notify"):
+            continue
         try:
             mailboxes = get_all_active_mailboxes()
         except Exception as e:
@@ -1172,7 +1721,7 @@ def setup_bot_commands():
         BotCommand("mystats", "📊 إحصائياتي"),
     ]
     admin_commands = public_commands + [
-        BotCommand("stats", "📊 إحصائيات البوت (أدمن)"),
+        BotCommand("settings", "🛠️ الإعدادات (لوحة تحكم الأدمن)"),
     ]
     try:
         bot.set_my_commands(public_commands)  # القائمة الافتراضية لكل المستخدمين
