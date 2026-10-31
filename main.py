@@ -597,7 +597,7 @@ def build_welcome_keyboard():
     keyboard = {
         "inline_keyboard": [
             [{"text": "📨 إنشاء بريد عشوائي", "callback_data": "generate_email", "style": "primary"}],
-            [{"text": "👨‍💻 المطور", "url": "tg://user?id=6043858925", "style": "primary"}],
+            [{"text": "📢 قناة البوت", "url": f"https://t.me/{CHANNEL_USERNAME[1:]}", "style": "primary"}],
         ]
     }
     return RawMarkup(keyboard)
