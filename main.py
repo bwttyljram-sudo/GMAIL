@@ -96,6 +96,20 @@ def init_db():
             created_at TEXT
         )
     """)
+    # سجل كل البريد الذي أنشأه المستخدم (ميزة "بريداتي المحفوظة")
+    db_execute("""
+        CREATE TABLE IF NOT EXISTS saved_mailboxes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            provider TEXT,
+            address TEXT,
+            password TEXT,
+            token TEXT,
+            login TEXT,
+            domain TEXT,
+            created_at TEXT
+        )
+    """)
     # الرسائل التي تم عرضها مسبقًا، محفوظة بشكل دائم لتفادي إعادة إرسالها بعد إعادة التشغيل
     db_execute("""
         CREATE TABLE IF NOT EXISTS seen_messages (
@@ -231,6 +245,50 @@ def get_all_active_mailboxes():
     except Exception as e:
         print(f"[get_all_active_mailboxes] تعذر الجلب: {e}")
         return []
+
+
+def save_mailbox_history(user_id, mailbox):
+    """يضيف البريد لسجل المستخدم الدائم (لا يكرر نفس العنوان)."""
+    try:
+        exists = db_execute(
+            "SELECT id FROM saved_mailboxes WHERE user_id = ? AND address = ?", [user_id, mailbox.get("address")]
+        ).rows
+        if exists:
+            return
+        db_execute(
+            "INSERT INTO saved_mailboxes (user_id, provider, address, password, token, login, domain, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [user_id, mailbox.get("provider"), mailbox.get("address"), mailbox.get("password"),
+             mailbox.get("token"), mailbox.get("login"), mailbox.get("domain"), datetime.utcnow().isoformat()],
+        )
+    except Exception as e:
+        print(f"[save_mailbox_history] {e}")
+
+
+def list_saved_mailboxes(user_id, limit=10):
+    try:
+        rows = db_execute(
+            "SELECT id, address FROM saved_mailboxes WHERE user_id = ? ORDER BY id DESC LIMIT ?", [user_id, limit]
+        ).rows
+        return [(r[0], r[1]) for r in rows]
+    except Exception as e:
+        print(f"[list_saved_mailboxes] {e}")
+        return []
+
+
+def get_saved_mailbox(user_id, row_id):
+    try:
+        rows = db_execute(
+            "SELECT provider, address, password, token, login, domain FROM saved_mailboxes WHERE user_id = ? AND id = ?",
+            [user_id, row_id],
+        ).rows
+        if not rows:
+            return None
+        r = rows[0]
+        return {"provider": r[0], "address": r[1], "password": r[2], "token": r[3], "login": r[4], "domain": r[5]}
+    except Exception as e:
+        print(f"[get_saved_mailbox] {e}")
+        return None
 
 
 def get_mailbox(user_id):
@@ -586,46 +644,83 @@ class RawMarkup(telebot.types.JsonSerializable):
         return json.dumps(self._keyboard_dict)
 
 
+def btn(text, style, callback_data=None, url=None):
+    """زر ملوّن. style: primary (أزرق) / success (أخضر) / danger (أحمر). كل أزرار البوت تمر من هنا."""
+    b = {"text": text, "style": style}
+    if url:
+        b["url"] = url
+    else:
+        b["callback_data"] = callback_data
+    return b
+
+
+def colored(rows):
+    return RawMarkup({"inline_keyboard": rows})
+
+
+CHANNEL_URL = f"https://t.me/{CHANNEL_USERNAME[1:]}"
+
+
 def build_subscribe_keyboard():
-    keyboard = {
-        "inline_keyboard": [
-            [{"text": "📢 انضم إلى قناة البوت", "url": f"https://t.me/{CHANNEL_USERNAME[1:]}", "style": "primary"}],
-            [{"text": "✅ زر التحقق", "callback_data": "check_sub", "style": "success"}],
-        ]
-    }
-    return RawMarkup(keyboard)
+    return colored([
+        [btn("📢 انضم إلى قناة البوت", "primary", url=CHANNEL_URL)],
+        [btn("✅ زر التحقق", "success", callback_data="check_sub")],
+    ])
 
 
 def build_welcome_keyboard():
-    keyboard = {
-        "inline_keyboard": [
-            [{"text": "📨 إنشاء بريد عشوائي", "callback_data": "generate_email", "style": "primary"}],
-            [{"text": "📢 قناة البوت", "url": f"https://t.me/{CHANNEL_USERNAME[1:]}", "style": "primary"}],
-        ]
-    }
-    return RawMarkup(keyboard)
+    return colored([
+        [btn("📨 إنشاء بريد عشوائي", "primary", callback_data="generate_email")],
+        [btn("📚 بريداتي المحفوظة", "success", callback_data="my_emails")],
+        [btn("📢 قناة البوت", "primary", url=CHANNEL_URL)],
+    ])
+
+
+def build_mailbox_keyboard():
+    return colored([
+        [btn("🔄 فحص صندوق الوارد", "primary", callback_data="check_inbox")],
+        [btn("🗑️ تغيير البريد", "danger", callback_data="generate_email")],
+        [btn("📚 بريداتي المحفوظة", "success", callback_data="my_emails")],
+    ])
+
+
+def build_mailbox_text(email, title="✅ **تم إنشاء بريدك بنجاح**"):
+    return (
+        f"{title}\n"
+        "━━━━━━━━━━━━━━\n"
+        f"📧 `{email}`\n"
+        "(اضغط على البريد لنسخه)\n\n"
+        "1️⃣ استخدم هذا البريد للتسجيل في أي موقع\n"
+        "2️⃣ اضغط \"فحص صندوق الوارد\" لاستقبال الرسائل ورموز التحقق\n"
+        "🔔 أو فقط انتظر — سيصلك أي كود جديد تلقائيًا بدون أي ضغط"
+    )
 
 
 def build_domain_keyboard():
-    """لوحة اختيار الدومين (ميزة الدومين المخصص) + خيار عشوائي."""
+    """لوحة اختيار الدومين + خيار عشوائي + رجوع."""
     try:
         domains = mailtm_list_domains()[:6]
     except Exception as e:
         print(f"[build_domain_keyboard] تعذر جلب الدومينات: {e}")
         domains = []
 
-    rows = []
-    pair = []
+    rows, pair = [], []
     for d in domains:
-        pair.append({"text": f"@{d}", "callback_data": f"pick_domain:{d}", "style": "primary"})
+        pair.append(btn(f"@{d}", "primary", callback_data=f"pick_domain:{d}"))
         if len(pair) == 2:
             rows.append(pair)
             pair = []
     if pair:
         rows.append(pair)
-    rows.append([{"text": "🎲 عشوائي", "callback_data": "pick_domain:random", "style": "success"}])
+    rows.append([btn("🎲 عشوائي", "success", callback_data="pick_domain:random")])
+    rows.append([btn("🔙 رجوع", "danger", callback_data="back_menu")])
+    return colored(rows)
 
-    return RawMarkup({"inline_keyboard": rows})
+
+def build_my_emails_keyboard(user_id):
+    rows = [[btn(f"📧 {addr}", "primary", callback_data=f"use_mail:{rid}")] for rid, addr in list_saved_mailboxes(user_id)]
+    rows.append([btn("🔙 رجوع", "danger", callback_data="back_menu")])
+    return colored(rows)
 
 
 def show_main_menu(chat_id, user_id, first_name=None):
@@ -763,24 +858,58 @@ def callback_query(call):
         user_emails[user_id] = mailbox  # تخزين سريع بالذاكرة
         save_active_mailbox(user_id, mailbox)  # حفظ دائم بـ Turso يبقى بعد إعادة تشغيل السيرفر
         clear_seen(user_id)  # بريد جديد = صندوق وارد فارغ
+        save_mailbox_history(user_id, mailbox)  # حفظه بسجل "بريداتي المحفوظة"
         email = mailbox["address"]
 
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🔄 فحص صندوق الوارد", callback_data="check_inbox"))
-        markup.add(InlineKeyboardButton("🗑️ تغيير البريد", callback_data="generate_email"))
-
-        text = (
-            "✅ **تم إنشاء بريدك بنجاح**\n"
-            "━━━━━━━━━━━━━━\n"
-            f"📧 `{email}`\n"
-            "(اضغط على البريد لنسخه)\n\n"
-            "1️⃣ استخدم هذا البريد للتسجيل في أي موقع\n"
-            "2️⃣ اضغط \"فحص صندوق الوارد\" لاستقبال الرسائل ورموز التحقق\n"
-            "🔔 أو فقط انتظر — سيصلك أي كود جديد تلقائيًا بدون أي ضغط"
-        )
+        markup = build_mailbox_keyboard()
+        text = build_mailbox_text(email)
 
         # تعديل الرسالة السابقة بدلاً من إرسال رسالة جديدة لتجربة مستخدم أفضل
         bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text=text, reply_markup=markup, parse_mode="Markdown")
+
+    elif call.data == "my_emails":
+        saved = list_saved_mailboxes(user_id)
+        text = "📚 **بريداتك المحفوظة**\nاختر بريدًا لتفعيله وفحص صندوقه:" if saved else "📭 لا يوجد لديك بريد محفوظ بعد.\nأنشئ بريدًا وسيُحفظ هنا تلقائيًا."
+        try:
+            bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
+                                  text=text, reply_markup=build_my_emails_keyboard(user_id), parse_mode="Markdown")
+        except Exception as e:
+            print(f"[my_emails] {e}")
+            bot.send_message(call.message.chat.id, text, reply_markup=build_my_emails_keyboard(user_id), parse_mode="Markdown")
+
+    elif call.data.startswith("use_mail:"):
+        try:
+            row_id = int(call.data.split(":", 1)[1])
+        except ValueError:
+            return
+        mailbox = get_saved_mailbox(user_id, row_id)
+        if not mailbox:
+            bot.answer_callback_query(call.id, "⚠️ هذا البريد غير موجود.", show_alert=True)
+            return
+        if mailbox["provider"] == "mailtm" and mailbox.get("password"):
+            try:  # تجديد التوكن (قد يكون انتهى)
+                tr = requests.post(f"{MAILTM_BASE}/token",
+                                   json={"address": mailbox["address"], "password": mailbox["password"]}, timeout=10)
+                tr.raise_for_status()
+                mailbox["token"] = tr.json().get("token")
+            except Exception as e:
+                print(f"[use_mail] تعذر تجديد التوكن: {e}")
+        user_emails[user_id] = mailbox
+        save_active_mailbox(user_id, mailbox)
+        bot.answer_callback_query(call.id, "✅ تم تفعيل البريد")
+        try:
+            bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
+                                  text=build_mailbox_text(mailbox["address"], "📧 **البريد المفعّل**"),
+                                  reply_markup=build_mailbox_keyboard(), parse_mode="Markdown")
+        except Exception as e:
+            print(f"[use_mail] {e}")
+
+    elif call.data == "back_menu":
+        try:
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+        except Exception:
+            pass
+        show_main_menu(call.message.chat.id, user_id, call.from_user.first_name)
 
     elif call.data == "check_inbox":
         log_request(user_id, "check_inbox")
@@ -879,12 +1008,8 @@ def format_stats_message():
 
 
 def stats_keyboard():
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("🔄 تحديث الإحصائيات", callback_data="refresh_stats"))
-    return markup
+    return colored([[btn("🔄 تحديث الإحصائيات", "success", callback_data="refresh_stats")]])
 
-
-# ================= لوحة الأدمن: الإذاعة التدريجية =================
 
 def run_broadcast(from_chat_id, from_message_id):
     """يرسل رسالة (أي نوع محتوى) لكل مستخدمي البوت تدريجيًا لتفادي حظر تيليجرام للبوت."""
