@@ -51,9 +51,19 @@ db_lock = threading.Lock()
 
 
 def db_execute(sql, params=None):
-    """تنفيذ استعلام واحد على Turso بأمان من عدة Threads."""
-    with db_lock:
+    """
+    تنفيذ استعلام واحد على Turso بأمان من عدة Threads.
+    ننتظر القفل لمدة محدودة فقط (8 ثوانٍ) بدل الانتظار للأبد — لو تعلّق طلب واحد
+    (مثلاً بسبب بطء بالشبكة)، باقي أوامر البوت (زي /start) ما تتوقف وتسكت،
+    بل تفشل بسرعة وتدخل بمسار except الموجود أصلاً عند كل استدعاء.
+    """
+    acquired = db_lock.acquire(timeout=8)
+    if not acquired:
+        raise TimeoutError("تعذر الحصول على قفل قاعدة البيانات خلال 8 ثوانٍ (طلب آخر متعلّق)")
+    try:
         return db_client.execute(sql, params or [])
+    finally:
+        db_lock.release()
 
 
 def init_db():
@@ -1025,7 +1035,6 @@ if __name__ == "__main__":
     print("Bot is running...")
     # تشغيل البوت
     bot.infinity_polling(timeout=10, long_polling_timeout=5)
-
 
 
 
