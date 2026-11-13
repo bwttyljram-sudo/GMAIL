@@ -154,7 +154,7 @@ DEFAULT_SETTINGS = {
     "maintenance": "0",    # وضع الصيانة
     "force_sub": "1",      # الاشتراك الإجباري
     "auto_notify": "1",    # الإشعار التلقائي للوارد
-    "auto_interval": "25", # ثواني بين كل دورة فحص تلقائي
+    "auto_interval": "15", # ثواني بين كل دورة فحص تلقائي
     "rate_limit": "3",     # ثواني بين ضغطات الأزرار
     "max_saved": "20",     # أقصى عدد بريد محفوظ لكل مستخدم
     "welcome_text": "",    # رسالة ترحيب مخصصة (فارغ = الافتراضية)
@@ -220,6 +220,13 @@ def log_error(where, err):
 class _ExceptionLogger:
     """يلتقط أي خطأ يحدث داخل معالجات تيليجرام ويسجله بدل أن يضيع."""
     def handle(self, exception):
+        txt = str(exception)
+        transient = isinstance(exception, (requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout,
+                                           requests.exceptions.ConnectionError)) \
+            or any(k in txt for k in ("502", "503", "504", "Bad Gateway", "Read timed out"))
+        if transient:
+            print(f"[telebot] عطل شبكة مؤقت (يُعاد تلقائيًا): {type(exception).__name__}")
+            return True  # ضجيج عابر من تيليجرام/الشبكة: لا يُسجّل بسجل الأخطاء
         log_error("telebot", exception)
         return True
 
@@ -351,6 +358,27 @@ def get_all_active_mailboxes():
         ]
     except Exception as e:
         print(f"[get_all_active_mailboxes] تعذر الجلب: {e}")
+        return []
+
+
+AUTO_WINDOW_HOURS = 24  # نراقب فقط من تفاعل مع البوت خلال آخر 24 ساعة (لتخفيف الحمل وتسريع الدورة)
+
+
+def get_recent_active_mailboxes(hours=AUTO_WINDOW_HOURS):
+    try:
+        cutoff = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
+        rows = db_execute(
+            "SELECT a.user_id, a.provider, a.address, a.password, a.token, a.login, a.domain "
+            "FROM active_mailboxes a JOIN users u ON u.user_id = a.user_id "
+            "WHERE u.last_active >= ? ORDER BY u.last_active DESC",
+            [cutoff],
+        ).rows
+        return [
+            (r[0], {"provider": r[1], "address": r[2], "password": r[3], "token": r[4], "login": r[5], "domain": r[6]})
+            for r in rows
+        ]
+    except Exception as e:
+        log_error("get_recent_active_mailboxes", e)
         return []
 
 
@@ -551,24 +579,62 @@ def _mailtm_create_account(domain=None):
     return {"provider": "mailtm", "address": address, "password": password, "token": token}
 
 
+def _mailtm_get(path, token, tries=3):
+    """طلب GET لـ mail.tm مع إعادة المحاولة تلقائيًا عند الضغط (429) أو أعطال الخادم/الشبكة."""
+    last = None
+    for i in range(tries):
+        try:
+            r = requests.get(f"{MAILTM_BASE}{path}", headers={"Authorization": f"Bearer {token}"}, timeout=12)
+            if r.status_code == 429 or r.status_code >= 500:
+                last = requests.HTTPError(f"HTTP {r.status_code}", response=r)
+                try:
+                    wait = float(r.headers.get("Retry-After", 0)) if r.status_code == 429 else 0
+                except ValueError:
+                    wait = 0
+                time.sleep(min(max(wait, 0.8 * (i + 1)), 4))
+                continue
+            r.raise_for_status()
+            return r.json()
+        except requests.exceptions.RequestException as e:
+            code = getattr(getattr(e, "response", None), "status_code", None)
+            if code in (401, 403, 404):
+                raise  # لا فائدة من التكرار
+            last = e
+            time.sleep(0.8 * (i + 1))
+    raise last
+
+
+def _refresh_mailtm_token(mailbox):
+    """يجدد توكن mail.tm (إذا انتهى) ويحفظه بقاعدة البيانات."""
+    r = requests.post(f"{MAILTM_BASE}/token",
+                      json={"address": mailbox["address"], "password": mailbox["password"]}, timeout=12)
+    r.raise_for_status()
+    tok = r.json().get("token")
+    mailbox["token"] = tok
+    for table in ("active_mailboxes", "saved_mailboxes"):
+        try:
+            db_execute(f"UPDATE {table} SET token = ? WHERE address = ?", [tok, mailbox["address"]])
+        except Exception as e:
+            print(f"[refresh_token] {e}")
+
+
+def _mailtm_call(mailbox, path):
+    try:
+        return _mailtm_get(path, mailbox["token"])
+    except requests.HTTPError as e:
+        code = getattr(getattr(e, "response", None), "status_code", None)
+        if code == 401 and mailbox.get("password"):
+            _refresh_mailtm_token(mailbox)
+            return _mailtm_get(path, mailbox["token"])
+        raise
+
+
 def _mailtm_get_messages(token):
-    resp = requests.get(
-        f"{MAILTM_BASE}/messages",
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=10,
-    )
-    resp.raise_for_status()
-    return resp.json().get("hydra:member", [])
+    return _mailtm_get("/messages", token).get("hydra:member", [])
 
 
 def _mailtm_get_message_detail(token, message_id):
-    resp = requests.get(
-        f"{MAILTM_BASE}/messages/{message_id}",
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=10,
-    )
-    resp.raise_for_status()
-    return resp.json()
+    return _mailtm_get(f"/messages/{message_id}", token)
 
 
 def _onesecmail_create_account():
@@ -613,13 +679,13 @@ def create_temp_email(domain=None):
 
 def get_inbox(mailbox):
     if mailbox["provider"] == "mailtm":
-        return _mailtm_get_messages(mailbox["token"])
+        return _mailtm_call(mailbox, "/messages").get("hydra:member", [])
     return _onesecmail_get_messages(mailbox["login"], mailbox["domain"])
 
 
 def get_message_detail(mailbox, message_id):
     if mailbox["provider"] == "mailtm":
-        return _mailtm_get_message_detail(mailbox["token"], message_id)
+        return _mailtm_call(mailbox, f"/messages/{message_id}")
     return _onesecmail_get_message_detail(mailbox["login"], mailbox["domain"], message_id)
 
 
@@ -634,6 +700,9 @@ def extract_verification_code(subject: str, body: str):
     """يحاول استخراج رمز تحقق (4-8 أرقام) من الموضوع أو محتوى الرسالة."""
     import re
     for text in (subject or "", body or ""):
+        grouped = re.search(r"(?<!\d)(\d{3})[ \-](\d{3})(?!\d)", text)  # مثل 339 645 أو 339-645
+        if grouped:
+            return grouped.group(1) + grouped.group(2)
         match = re.search(r"\b(\d{4,8})\b", text)
         if match:
             return match.group(1)
@@ -717,6 +786,48 @@ def send_message_safe(chat_id, text):
         bot.send_message(chat_id, text, disable_web_page_preview=True)
 
 
+_deliver_locks = {}
+
+
+def fetch_message_or_fallback(mailbox, msg):
+    """المحتوى الكامل للرسالة، وإن تعذّر نبني بديلًا من بيانات القائمة (الموضوع + المقتطف) بدل ما تضيع."""
+    try:
+        return get_message_detail(mailbox, msg["id"])
+    except Exception as e:
+        print(f"[fetch] تعذر جلب المحتوى الكامل ({e}) — نستخدم الموضوع والمقتطف")
+        return {"from": msg.get("from"), "subject": msg.get("subject"), "textBody": msg.get("intro") or ""}
+
+
+def deliver_new_messages(user_id, mailbox, messages=None):
+    """
+    يرسل للمستخدم كل الرسائل الجديدة (للفحص اليدوي والتلقائي معًا). يرجع عدد المرسل.
+    القاعدة الأهم: لا نعلّم الرسالة "مقروءة" إلا بعد إرسالها فعلًا، وإذا تعذّر جلب
+    محتواها الكامل نرسل الموضوع + المقتطف من القائمة بدل ما تضيع.
+    """
+    lock = _deliver_locks.setdefault(user_id, threading.Lock())
+    with lock:  # يمنع التكرار لو تزامن الفحص اليدوي مع التلقائي
+        if messages is None:
+            messages = get_inbox(mailbox)
+        seen = get_seen_set(user_id)
+        new_messages = [m for m in messages if m["id"] not in seen]
+        new_messages.reverse()  # الأقدم أولًا
+        delivered = 0
+        for msg in new_messages:
+            read_msg = fetch_message_or_fallback(mailbox, msg)
+            try:
+                send_message_safe(user_id, build_incoming_message_text(read_msg))
+            except Exception as e:
+                text = str(e).lower()
+                if any(k in text for k in ("403", "blocked", "deactivated", "chat not found")):
+                    mark_message_seen(user_id, msg["id"])  # المستخدم حظر البوت: لا فائدة من التكرار
+                else:
+                    log_error("deliver/send", e)  # عطل مؤقت: نعيد المحاولة بالدورة القادمة
+                continue
+            mark_message_seen(user_id, msg["id"])
+            delivered += 1
+        return delivered
+
+
 # ================= قواعد البيانات المؤقتة =================
 user_emails = {} # لتخزين البريد النشط لكل مستخدم
 user_last_action = {} # للحد من الطلبات (Rate Limiting)
@@ -780,6 +891,7 @@ BUTTON_KEYS = {
     "join": ("📢 انضم إلى القناة", "primary"),
     "verify": ("✅ زر التحقق", "success"),
     "inbox": ("🔄 فحص الوارد", "primary"),
+    "last_msg": ("📨 عرض آخر رسالة", "primary"),
     "change": ("🗑️ تغيير البريد", "danger"),
     "save": ("💾 حفظ هذا البريد", "success"),
     "back": ("🔙 رجوع", "danger"),
@@ -841,6 +953,7 @@ def build_welcome_keyboard():
 def build_mailbox_keyboard():
     return colored([
         [btn("inbox", "🔄 فحص صندوق الوارد", callback_data="check_inbox")],
+        [btn("last_msg", "📨 عرض آخر رسالة", callback_data="last_msg")],
         [btn("save", "💾 حفظ هذا البريد", callback_data="save_mail"),
          btn("change", "🗑️ تغيير البريد", callback_data="generate_email")],
         [btn("my_emails", "📚 بريداتي المحفوظة", callback_data="my_emails")],
@@ -1063,6 +1176,25 @@ def callback_query(call):
         # تعديل الرسالة السابقة بدلاً من إرسال رسالة جديدة لتجربة مستخدم أفضل
         bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text=text, reply_markup=markup, parse_mode="Markdown")
 
+    elif call.data == "last_msg":
+        mailbox = get_mailbox(user_id)
+        if not mailbox:
+            bot.answer_callback_query(call.id, "⚠️ لم تقم بإنشاء بريد بعد!", show_alert=True)
+            return
+        try:
+            msgs = get_inbox(mailbox)
+        except Exception as e:
+            log_error("last_msg", e)
+            bot.answer_callback_query(call.id, "❌ تعذر الاتصال بخدمة البريد، حاول لاحقًا.", show_alert=True)
+            return
+        if not msgs:
+            bot.answer_callback_query(call.id, "📭 صندوق الوارد فارغ.", show_alert=True)
+            return
+        bot.answer_callback_query(call.id)
+        newest = msgs[0]
+        send_message_safe(user_id, build_incoming_message_text(fetch_message_or_fallback(mailbox, newest)))
+        mark_message_seen(user_id, newest["id"])
+
     elif call.data == "my_emails":
         try:
             bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
@@ -1167,16 +1299,7 @@ def callback_query(call):
             return
 
         bot.answer_callback_query(call.id, "📬 توجد رسائل جديدة!", show_alert=False)
-        for msg in new_messages:
-            mark_message_seen(user_id, msg['id'])  # وضع علامة "تم عرضها" فورًا (بالذاكرة + Turso) لتفادي التكرار
-            try:
-                read_msg = get_message_detail(mailbox, msg['id'])
-            except Exception as e:
-                print(f"[check_inbox] readMessage error: {e}")
-                bot.send_message(user_id, "⚠️ تعذر جلب محتوى رسالة.")
-                continue
-
-            send_message_safe(user_id, build_incoming_message_text(read_msg))
+        deliver_new_messages(user_id, mailbox, req)
 
 
 def format_stats_message():
@@ -1228,13 +1351,22 @@ def adm_back(to="adm:main"):
     return [fbtn("🔙 رجوع", "danger", callback_data=to)]
 
 
+def adm_auto_status_text():
+    lc = auto_status.get("last_cycle")
+    if not lc:
+        return "لم تكتمل دورة بعد"
+    return (f"آخر دورة قبل {int(time.time() - lc)}ث — {auto_status['mailboxes']} بريد، "
+            f"أُرسل {auto_status['delivered']}، استغرقت {auto_status['seconds']}ث، أخطاء {auto_status['errors']}")
+
+
 def adm_main_text():
     return (
         "🛠️ لوحة تحكم البوت\n"
         "━━━━━━━━━━━━━━\n"
         f"🔧 الصيانة: {'مفعّلة' if get_bool('maintenance') else 'متوقفة'}\n"
         f"📢 الاشتراك الإجباري: {'مفعّل' if get_bool('force_sub') else 'متوقف'}\n"
-        f"🔔 الإشعار التلقائي: {'مفعّل' if get_bool('auto_notify') else 'متوقف'}\n\n"
+        f"🔔 الإشعار التلقائي: {'مفعّل' if get_bool('auto_notify') else 'متوقف'}\n"
+        f"🩺 المراقبة: {adm_auto_status_text()}\n\n"
         "اختر القسم:"
     )
 
@@ -1283,7 +1415,7 @@ def adm_settings_kb():
 
 
 CYCLE_VALUES = {
-    "auto_interval": [10, 25, 60, 120],
+    "auto_interval": [10, 15, 30, 60],
     "rate_limit": [1, 3, 5, 10],
     "max_saved": [10, 20, 30, 50],
 }
@@ -1676,41 +1808,54 @@ def general_handler(message):
 # ================= المراقبة التلقائية للوارد (إشعار فوري بدون ضغط المستخدم) =================
 
 
+auto_status = {"last_cycle": None, "mailboxes": 0, "delivered": 0, "seconds": 0.0, "errors": 0}
+
+
+def _check_one(user_id, mailbox):
+    """يفحص بريد مستخدم واحد. أي خطأ هنا لا يجوز أن يوقف بقية المستخدمين أو الحلقة."""
+    try:
+        time.sleep(0.15)  # تخفيف الضغط على mail.tm
+        messages = get_inbox(mailbox)
+        if not messages:
+            return 0
+        return deliver_new_messages(user_id, mailbox, messages)
+    except Exception as e:
+        auto_status["errors"] += 1
+        print(f"[auto_notify] مستخدم {user_id}: {e}")
+        return 0
+
+
 def auto_notify_loop():
-    """يفحص كل البريد النشط (من Turso) بالخلفية دوريًا، ويرسل أي رسالة جديدة تلقائيًا."""
+    """يفحص البريد النشط للمستخدمين الفعّالين بالخلفية (3 بالتوازي) ويرسل الجديد تلقائيًا. لا يتوقف أبدًا."""
+    from concurrent.futures import ThreadPoolExecutor
+    pool = ThreadPoolExecutor(max_workers=3)
+    print("[auto_notify] بدأت المراقبة التلقائية")
     while True:
-        time.sleep(get_int("auto_interval"))
-        if not get_bool("auto_notify"):
-            continue
         try:
-            mailboxes = get_all_active_mailboxes()
+            time.sleep(get_int("auto_interval"))
+            if not get_bool("auto_notify"):
+                continue
+            t0 = time.time()
+            boxes = get_recent_active_mailboxes()
+            delivered = sum(pool.map(lambda ub: _check_one(*ub), boxes))
+            auto_status.update(last_cycle=time.time(), mailboxes=len(boxes), delivered=delivered,
+                               seconds=round(time.time() - t0, 1))
         except Exception as e:
-            print(f"[auto_notify_loop] تعذر جلب قائمة البريد النشط: {e}")
-            continue
+            log_error("auto_notify_loop", e)
+            time.sleep(5)
 
-        for user_id, mailbox in mailboxes:
-            try:
-                messages = get_inbox(mailbox)
-            except Exception as e:
-                print(f"[auto_notify_loop] تعذر فحص بريد المستخدم {user_id}: {e}")
-                continue
 
-            if not messages:
-                continue
-
-            seen = get_seen_set(user_id)
-            new_messages = [m for m in messages if m['id'] not in seen]
-
-            for msg in new_messages:
-                mark_message_seen(user_id, msg['id'])
-                try:
-                    read_msg = get_message_detail(mailbox, msg['id'])
-                except Exception as e:
-                    print(f"[auto_notify_loop] تعذر جلب محتوى رسالة للمستخدم {user_id}: {e}")
-                    continue
-                send_message_safe(user_id, build_incoming_message_text(read_msg))
-
-            time.sleep(0.3)  # تأخير بسيط بين كل مستخدم وآخر لتفادي ضغط زائد على APIs الخارجية
+def self_ping_loop():
+    """يزور رابط الخدمة العام كل 9 دقائق حتى لا ينام البوت على خطة ريندر المجانية (ينام بعد 15 دقيقة خمول)."""
+    url = os.getenv("RENDER_EXTERNAL_URL")
+    if not url:
+        return
+    while True:
+        time.sleep(540)
+        try:
+            requests.get(url, timeout=15)
+        except Exception as e:
+            print(f"[self_ping] {e}")
 
 
 # ================= تشغيل البوت والخادم =================
@@ -1746,10 +1891,11 @@ if __name__ == "__main__":
 
     # تشغيل مراقبة الوارد التلقائية بالخلفية (ميزة الإشعار الفوري)
     threading.Thread(target=auto_notify_loop, daemon=True).start()
+    threading.Thread(target=self_ping_loop, daemon=True).start()
 
     print("Bot is running...")
     # تشغيل البوت
-    bot.infinity_polling(timeout=10, long_polling_timeout=5)
+    bot.infinity_polling(timeout=30, long_polling_timeout=20)
 
 
 
