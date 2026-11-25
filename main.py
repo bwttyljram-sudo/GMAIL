@@ -12,8 +12,8 @@ from keep_alive import keep_alive
 BOT_TOKEN = os.getenv("BOT_TOKEN") 
 bot = telebot.TeleBot(BOT_TOKEN, threaded=True, num_threads=12)
 
-CHANNEL_USERNAME = "@ZenoX_Tools"
-ADMIN_ID = 6043858925
+CHANNEL_USERNAME = "@Zenox_Tols"
+ADMIN_ID = 9253474579
 
 # نفتح بورت الخادم الوهمي فورًا وأول شيء، قبل أي محاولة اتصال بقاعدة البيانات.
 # هذا يضمن أن ريندر يكتشف الخدمة "تعمل" حتى لو تعطل الاتصال بـ Turso أو تأخر،
